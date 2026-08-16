@@ -133,18 +133,30 @@ const fmt = (v: number): string => v.toFixed(2)
  * | 条件 | 警告 | certainty |
  * |---|---|---|
  * | bbox の Y 範囲が重ならない | `EMPTY_INTERSECTION`（生成しない） | exact |
+ * | 全走査線で両側同時の被覆がない | `EMPTY_INTERSECTION`（生成しない） | exact |
  * | 片側のみ被覆が空の帯 | `EMPTY_BAND` | exact |
- * | 全走査線で区間数の積が 2 以上 | `LIKELY_DISCONNECTED` | estimated |
+ * | 両側被覆のある全走査線で島数の積が 2 以上 | `LIKELY_DISCONNECTED` | estimated |
  * | 最小区間幅が閾値未満 | `THIN_NECK` | estimated |
  *
- * `emptyBands` の from/to は「空だった走査線の並び」をセル境界まで広げた値で、
- * 実際の空帯の端とは走査線 1 本分（±(hi−lo)/N）の誤差を持ちうる。
+ * bbox の重なりは被覆の重なりの必要条件にすぎない（例：外輪郭と同一の穴を持つ
+ * シルエットは bbox が正常でも被覆が常に空）。そのため走査後にも判定し、
+ * 両側同時の被覆を持つ走査線が 1 本もなければ `EMPTY_INTERSECTION` を報告する。
  *
- * `estimatedComponents` は「両側とも被覆がある走査線」における区間数の積
- * m×n の最小値（該当走査線がなければ 0）。**3D 連結成分数の下限ではない。**
+ * `emptyBands` の from/to は **実際に空を観測した走査線の中点**（連続する空走査線の
+ * 最初と最後）であり、観測した範囲だけを報告する。範囲そのものは実測に基づく。
+ * ただし走査線 1 本分（(hi−lo)/N）より狭い隙間はどの走査線にも掛からず
+ * **検出自体を取りこぼしうる**。これは検出分解能の限界であって、
+ * 報告した範囲が誤っていることとは別種の制約である。
+ *
+ * `estimatedComponents` は「両側とも被覆がある走査線」で観測したスライス島数の
+ * 直積 m×n の最小値（該当走査線がなければ 0）。**実際の 3D 連結成分数の
+ * 推定値でも下限でもない** — ある高さで分かれた島は別の高さで合流しうる。
+ * 確定値は生成後の `decompose()` のみを根拠とする（FR-014）。
  *
  * `ok` は警告ゼロを意味する。生成の可否そのものは `EMPTY_INTERSECTION` の
  * 有無で判断すること（EMPTY_BAND があっても生成は行う — US-001）。
+ *
+ * @throws `scanlineCount` が正の整数でない、または `thinNeckRatio` が負・非有限の場合
  */
 export function runPreflight(
   a: Contour[],
@@ -153,6 +165,17 @@ export function runPreflight(
 ): PreflightReport {
   const scanlineCount = options.scanlineCount ?? SCANLINE_COUNT
   const thinNeckRatio = options.thinNeckRatio ?? THIN_NECK_RATIO
+
+  if (!Number.isInteger(scanlineCount) || scanlineCount <= 0) {
+    throw new Error(
+      `scanlineCount は正の整数でなければなりません（指定値: ${scanlineCount}）`,
+    )
+  }
+  if (!Number.isFinite(thinNeckRatio) || thinNeckRatio < 0) {
+    throw new Error(
+      `thinNeckRatio は 0 以上の有限数でなければなりません（指定値: ${thinNeckRatio}）`,
+    )
+  }
 
   const rangeA = yRangeOf(a)
   const rangeB = yRangeOf(b)
@@ -188,8 +211,13 @@ export function runPreflight(
   let bandLastK = 0
   const closeBand = (): void => {
     if (bandSide !== null) {
-      // セル中点サンプリングなので、セル境界（±step/2）まで帯を広げる
-      emptyBands.push({ from: lo + bandFirstK * step, to: lo + (bandLastK + 1) * step, side: bandSide })
+      // 実際に空を観測した走査線の中点だけを範囲とする（セル境界へ広げない）。
+      // 広げると未観測の高さまで「空」と主張することになり exact でなくなる
+      emptyBands.push({
+        from: lo + (bandFirstK + 0.5) * step,
+        to: lo + (bandLastK + 0.5) * step,
+        side: bandSide,
+      })
       bandSide = null
     }
   }
@@ -228,7 +256,28 @@ export function runPreflight(
   }
   closeBand()
 
-  const estimatedComponents = minProduct === Infinity ? 0 : minProduct
+  if (minProduct === Infinity) {
+    // 両側同時の被覆を持つ走査線が 1 本もなかった。スライス恒等式より、
+    // サンプリングしたすべての高さで交差は空 — bbox が重なっていても
+    // 被覆が重ならない組（例：外輪郭と同一の穴を持つ空シルエット）はここで捕捉する。
+    // 立体そのものが存在しないため、個別の EMPTY_BAND は報告しない
+    return {
+      ok: false,
+      sharedYRange: null,
+      emptyBands: [],
+      estimatedComponents: 0,
+      warnings: [
+        {
+          code: 'EMPTY_INTERSECTION',
+          certainty: 'exact',
+          message:
+            'サンプリングしたすべての高さで、両シルエットの被覆が同時には存在しないため、この組み合わせの交差は空です。生成される立体はありません。',
+        },
+      ],
+    }
+  }
+
+  const estimatedComponents = minProduct
   const warnings: PreflightWarning[] = []
 
   for (const band of emptyBands) {
@@ -236,7 +285,7 @@ export function runPreflight(
       code: 'EMPTY_BAND',
       certainty: 'exact',
       band: [band.from, band.to],
-      message: `高さ y=${fmt(band.from)}〜${fmt(band.to)} の帯ではシルエット ${band.side} に被覆がないため、立体はこの帯で途切れます。これはこの組み合わせの性質です。`,
+      message: `高さ y=${fmt(band.from)}〜${fmt(band.to)} の帯では、サンプリングしたすべての高さでシルエット ${band.side} に被覆がないため、立体はこの帯で途切れます。これはこの組み合わせの性質です。`,
     })
   }
 
@@ -245,7 +294,7 @@ export function runPreflight(
       code: 'LIKELY_DISCONNECTED',
       certainty: 'estimated',
       components: estimatedComponents,
-      message: `どの高さでもスライスが ${estimatedComponents} 個以上の島に分かれているため、立体が複数のパーツに分離する可能性があります（確定した連結成分数は生成後の解析で求まります）。`,
+      message: `両側に被覆があるサンプリング高さのすべてでスライスが ${estimatedComponents} 個以上の島に分かれているため、立体が複数のパーツに分離する可能性があります（確定した連結成分数は生成後の解析で求まります）。`,
     })
   }
 

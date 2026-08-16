@@ -60,7 +60,7 @@ describe('geometry/preflight', () => {
     expect(warning!.message).not.toContain('可能性')
   })
 
-  it('i 型（棒＋離れた点）× 全高矩形は EMPTY_BAND を断定し、帯が実際の隙間を挟む', () => {
+  it('i 型（棒＋離れた点）× 全高矩形は EMPTY_BAND を断定し、帯は実際の隙間の内側にある', () => {
     // A: 棒 y∈[0,6] と点 y∈[8,10]。y∈(6,8) は真に空
     const a = [rect(-1, 0, 1, 6), rect(-1, 8, 1, 10)]
     // B: 全高の矩形 y∈[0,10]
@@ -77,9 +77,9 @@ describe('geometry/preflight', () => {
     const step = 10 / SCANLINE_COUNT
     expect(Math.abs(band.from - 6)).toBeLessThanOrEqual(step)
     expect(Math.abs(band.to - 8)).toBeLessThanOrEqual(step)
-    // 帯の内側は確実に隙間の中にある
-    expect(band.from).toBeGreaterThan(5.9)
-    expect(band.to).toBeLessThan(8.1)
+    // 帯は実測した空の走査線のみからなるため、真の隙間の内側に完全に収まる
+    expect(band.from).toBeGreaterThanOrEqual(6)
+    expect(band.to).toBeLessThanOrEqual(8)
 
     const warning = warningOf(report, 'EMPTY_BAND')
     expect(warning).toBeDefined()
@@ -89,6 +89,69 @@ describe('geometry/preflight', () => {
 
     // 空帯は分離の証明にはならない：LIKELY_DISCONNECTED は出さない
     expect(warningOf(report, 'LIKELY_DISCONNECTED')).toBeUndefined()
+  })
+
+  it('外輪郭と同一の穴で被覆が空のシルエットは EMPTY_INTERSECTION を断定する', () => {
+    // A: CCW 矩形 ＋ 同一形状の CW 穴。bbox は正常だが Positive fill の被覆は
+    // すべての高さで空。bbox の重なりだけでは検出できない組
+    const a = [rect(-1, 0, 1, 10), holeRect(-1, 0, 1, 10)]
+    const b = [rect(-2, 0, 2, 10)]
+    const report = runPreflight(a, b)
+
+    expect(report.ok).toBe(false)
+    expect(report.sharedYRange).toBeNull()
+    expect(report.emptyBands).toHaveLength(0)
+    expect(report.estimatedComponents).toBe(0)
+    expect(report.warnings).toHaveLength(1)
+
+    const warning = warningOf(report, 'EMPTY_INTERSECTION')
+    expect(warning).toBeDefined()
+    expect(warning!.certainty).toBe('exact')
+    // 断定の文体（〜です）であり、推定の文体（〜の可能性）ではない
+    expect(warning!.message).toContain('です')
+    expect(warning!.message).not.toContain('可能性')
+  })
+
+  it('EMPTY_BAND の範囲は実測した空の走査線に限定され、真の隙間の内側に収まる', () => {
+    // 真の隙間は y∈[0.50185, 0.50205]（幅 0.0002）。走査線間隔 1/256 ≈ 0.0039 より
+    // 狭いが、中点 y=128.5/256=0.501953125 がちょうど隙間に掛かり検出される。
+    // 旧実装はこの 1 点をセル 1 個分 [0.5, 0.50390625] へ広げて exact と主張していた
+    const a = [rect(-1, 0, 1, 0.50185), rect(-1, 0.50205, 1, 1)]
+    const b = [rect(-2, 0, 2, 1)]
+    const report = runPreflight(a, b)
+
+    expect(report.emptyBands).toHaveLength(1)
+    const band = report.emptyBands[0]
+    expect(band.side).toBe('A')
+    // overlap ではなく inside：報告範囲全体が真の隙間の中にある
+    expect(band.from).toBeGreaterThanOrEqual(0.50185)
+    expect(band.to).toBeLessThanOrEqual(0.50205)
+    expect(band.from).toBeLessThanOrEqual(band.to)
+
+    const warning = warningOf(report, 'EMPTY_BAND')
+    expect(warning).toBeDefined()
+    expect(warning!.certainty).toBe('exact')
+    expect(warning!.band).toEqual([band.from, band.to])
+  })
+
+  it('不正な scanlineCount は明確なエラーで拒否する', () => {
+    const a = [rect(-1, 0, 1, 1)]
+    const b = [rect(-1, 0, 1, 1)]
+    expect(() => runPreflight(a, b, { scanlineCount: 0 })).toThrow(/scanlineCount/)
+    expect(() => runPreflight(a, b, { scanlineCount: -8 })).toThrow(/scanlineCount/)
+    expect(() => runPreflight(a, b, { scanlineCount: 12.5 })).toThrow(/scanlineCount/)
+    expect(() => runPreflight(a, b, { scanlineCount: Number.NaN })).toThrow(/scanlineCount/)
+    expect(() => runPreflight(a, b, { scanlineCount: Infinity })).toThrow(/scanlineCount/)
+  })
+
+  it('不正な thinNeckRatio は明確なエラーで拒否する', () => {
+    const a = [rect(-1, 0, 1, 1)]
+    const b = [rect(-1, 0, 1, 1)]
+    expect(() => runPreflight(a, b, { thinNeckRatio: -0.01 })).toThrow(/thinNeckRatio/)
+    expect(() => runPreflight(a, b, { thinNeckRatio: Number.NaN })).toThrow(/thinNeckRatio/)
+    expect(() => runPreflight(a, b, { thinNeckRatio: Infinity })).toThrow(/thinNeckRatio/)
+    // 0 は「THIN_NECK 判定を無効化する」正当な指定として許容される
+    expect(() => runPreflight(a, b, { thinNeckRatio: 0 })).not.toThrow()
   })
 
   it('左右に離れた 2 パーツ × 矩形は LIKELY_DISCONNECTED を推定として報告する', () => {
