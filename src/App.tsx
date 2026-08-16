@@ -64,11 +64,21 @@ function SidebarSlot(props: { retry: () => void }) {
  * ならない（ADR-004）ため、ここでは参照が配線されていることだけを示す。
  */
 function ViewportSlot(props: { geometryRef: GeometryRef }) {
-  const hasGeometry = props.geometryRef.current !== null
+  // ref の代入は再レンダリングを起こさない（ADR-004: カメラ操作で React を
+  // 動かさないための設計）。したがって「いつ ref を読み直すか」は status の
+  // 購読で決める。これを省くと、生成が成功しても初回の null を読んだまま
+  // 画面が更新されない — Task 5.1 の Viewport も同じ配線が必要。
+  const status = useStudioStore((s) => s.status)
+  const geometry = status === 'success' ? props.geometryRef.current : null
   return (
     <div className="flex h-full items-center justify-center">
       <p className="text-xs text-neutral-600">
-        3D ビューポート（Wave 5 Task 5.1）— geometry: {hasGeometry ? 'あり' : 'なし'}
+        3D ビューポート（Wave 5 Task 5.1）— geometry:{' '}
+        {geometry
+          ? `あり（頂点 ${geometry.getAttribute('position').count} / 三角形 ${
+              (geometry.getIndex()?.count ?? 0) / 3
+            }）`
+          : 'なし'}
       </p>
     </div>
   )
