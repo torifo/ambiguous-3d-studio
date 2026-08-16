@@ -1,54 +1,87 @@
 # Ambiguous 3D Studio
 
-> ⚠️ 仮 README。実装はこれから（Phase 1 未着手）。
+**https://torifo.github.io/ambiguous-3d-studio/**
 
-2〜3 方向からの投影シルエットを同時に満たす「錯視立体（両義立体）」を、ブラウザ上でリアルタイムに合成・体験・出力する Web アプリケーション。
+正面から見ると「★」、側面から見ると「♥」——2 つの投影シルエットを同時に満たす錯視立体（両義立体）を、ブラウザ上で生成・体験・出力する Web アプリケーション。
 
-正面から見れば「★」、側面から見れば「♥」——そんな立体を、シルエットを 2 つ選ぶだけで生成し、その場で回して確かめ、3D プリンタ用の STL として持ち出せる。
+図形を 2 つ選ぶだけで立体が生成され、その場で回して錯視が成立する角度を探し、3D プリンタ用のバイナリ STL として持ち出せる。すべてクライアントサイドで完結し、入力したテキストや SVG は一切外部へ送信しない。
 
-## コンセプト
+## 仕組み
 
-射影幾何学 + CSG（Constructive Solid Geometry）演算。
-
-各シルエットを視線ベクトル方向へ押し出した柱状体 `M_A`, `M_B` を作り、その共通集合を取る：
+各シルエットを自身の視線軸に沿って押し出した角柱の、ブール交差を取る。
 
 ```
 M = M_A ∩ M_B
 ```
 
-これが「どちらの方向から見てもシルエットが成立する」立体になる。
+`M_A` はシルエット A を Z 軸方向へ、`M_B` はシルエット B を X 軸方向へ押し出した角柱。この共通部分は、正面（+Z）から見れば A の輪郭を、側面（+X）から見れば B の輪郭を持つ。
 
-## 機能（予定）
+CSG 演算には [manifold-3d](https://github.com/elalish/manifold)（WebAssembly）を使い、2D 輪郭を `CrossSection` に渡して直接押し出す。Three.js の `ExtrudeGeometry` を経由しないのは、その出力が非多様体の三角形スープになり、3D プリンタのスライサーが受け付ける保証が崩れるため。
 
-| 領域 | 内容 |
+## できること
+
+- **入力** — プリセット図形（円 / 正方形 / 正三角形 / ハート / 星 / 矢印 / 十字）、英数字 1〜8 文字、SVG ファイル
+- **ビューア** — 自由視点操作、視点スナップ（正面 / 側面 / 俯瞰）、Sweet Spot 検知（誤差 3.5° 未満）、仮想ミラー
+- **出力** — バイナリ STL（ミリメートル単位、スライサーへ直接）、GLB（メートル単位、Blender や Web 共有向け）
+- **3D プリント補助** — 分離パーツの検出、細いくびれの警告、台座の付与
+
+## 知っておくとよいこと
+
+### すべての図形の組み合わせが作れるわけではない
+
+高さ `y` における交差のスライスは、**A のその高さの被覆と B のその高さの被覆の直積**になる。したがって片方でも被覆が空になる高さ帯があると、交差はそこで必ず途切れる。
+
+小文字の `i`（点と本体が離れている）、間の空いた 2 文字、複数パーツからなる SVG では、これが必ず起きる。**実装の不具合ではなく数学的な必然**なので、アプリは生成前にその高さ帯を検出して提示する。
+
+同じ理由で、走査線の解析から「何個のパーツに分かれるか」を確定することはできない。ある高さで分かれた島が別の高さで合流しうるため、パーツ数は生成後の連結成分分解でのみ確定する。UI は断定できる警告と推定にとどまる警告を、文体とバッジで区別している。
+
+### 台座は錯視を壊す
+
+底面に付ける台座は、視点 A・B の**両方**のシルエットに矩形として現れる。両視点から見える位置に材料を足す以上、これは実装で回避できない。印刷の安定と引き換えのオプションであり、既定では無効。
+
+### 単位
+
+実寸は「共通シルエット高さのミリメートル値」ただ 1 つで定義される（既定 60mm）。STL はミリメートル、GLB / USDZ はメートル（glTF の慣例）で書き出す。
+
+## 技術スタック
+
+| 領域 | 採用技術 |
 |---|---|
-| 入力 | プリセット図形 / テキスト押し出し / SVG インポート、投影軸・角度設定 |
-| 生成 | 2D パスの押し出し、ブール交差演算、3D プリント用台座付与 |
-| ビューア | 自由視点操作、視点スナップ、Sweet Spot 検知（誤差 < 3.5°）、仮想ミラー |
-| AR | GLB / USDZ 動的生成によるゼロインストール WebAR |
-| 出力 | バイナリ STL / GLB ダウンロード |
+| フロントエンド | Vite + React + TypeScript |
+| 3D 描画 | Three.js / React Three Fiber |
+| CSG 演算 | manifold-3d 3.5.1（WebAssembly、Web Worker 上） |
+| 状態管理 | Zustand |
+| UI | Tailwind CSS |
+| 出力 | STLExporter / GLTFExporter |
 
-すべてクライアントサイド完結。入力したテキストや SVG は一切外部へ送信しない。
+CSG は専用 Worker 内のシングルスレッド Wasm で動く。GitHub Pages は COOP/COEP ヘッダを設定できず cross-origin isolation が得られないため、`SharedArrayBuffer` とマルチスレッド Wasm には依存していない。
 
-## 技術スタック（予定）
+## 性能
 
-- **フロントエンド**: Vite + React + TypeScript
-- **3D レンダリング**: Three.js / React Three Fiber（`@react-three/fiber`, `@react-three/drei`）
-- **幾何・CSG 演算**: manifold-3d (Wasm) または three-bvh-csg
-- **UI**: Tailwind CSS + Lucide React
-- **AR**: `@google/model-viewer`
-- **エクスポート**: STLExporter / GLTFExporter
+入力変更からメッシュ描画完了までの実測 P95 は **149.9ms**（147 サンプル、Apple Silicon / Chrome）。内訳の 81% は打鍵合流のためのデバウンス 120ms で、CSG 本体は 4.3ms。
 
-## ロードマップ
+## ローカル開発
 
-- **Phase 1 (MVP)** — プリセット図形同士の直交 CSG 交差パイプライン、R3F ビューポート、バイナリ STL ダウンロード
-- **Phase 2 (UX・錯視演出)** — テキスト / SVG 入力、視点スナップ、Sweet Spot 判定、仮想ミラー
-- **Phase 3 (WebAR・最適化)** — GLB / USDZ 動的生成と AR 起動、CSG 高速化（Web Worker / Wasm）
+```bash
+npm install
+npm run dev        # http://localhost:5173/ambiguous-3d-studio/
+```
+
+```bash
+npm run test       # Vitest（幾何ロジックと CSG 統合テストはブラウザ不要）
+npm run build      # tsc -b && vite build
+npm run lint
+```
+
+WebAR（Phase 3）は `VITE_ENABLE_AR=true` のローカルビルドでのみ有効。公開ビルドでは無効。
 
 ## ドキュメント
 
-- [要件定義書](docs/requirements.md)
+- [要件定義書（当初のブリーフ）](docs/requirements.md)
+- [EARS 記法の要件](specs/ambiguous-solid/requirements.md)
+- [技術設計・ADR・性能実測](specs/ambiguous-solid/design.md)
+- [タスクグラフ](specs/ambiguous-solid/tasks.md)
 
-## ステータス
+## ライセンス
 
-準備中 — リポジトリ初期化のみ。
+同梱フォントは [Inter](https://github.com/rsms/inter)（SIL Open Font License 1.1、[全文](public/fonts/OFL.txt)）。

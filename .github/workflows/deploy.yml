@@ -1,0 +1,71 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 進行中のデプロイは待たせず、最新の main を優先する
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+      - run: npx vitest run
+      - run: npm run build
+        env:
+          # Phase 3（WebAR）は実装されるがローカル限定。公開ビルドでは無効
+          VITE_ENABLE_AR: 'false'
+
+      # 本番ビルドでしか現れない失敗を、デプロイ前にここで落とす。
+      # Vite の Worker アセット解決は dev と本番で異なるため、dev で動いても
+      # Pages のサブパス配下で .wasm が 404 になりうる（design.md「Deployment」）。
+      - name: Verify the Wasm URL carries the Pages base
+        run: |
+          set -euo pipefail
+          worker=$(ls dist/assets/csg.worker-*.js)
+          echo "worker chunk: $worker"
+          if ! grep -q '/ambiguous-3d-studio/assets/manifold-.*\.wasm' "$worker"; then
+            echo "::error::worker chunk does not reference the wasm under the Pages base"
+            exit 1
+          fi
+          asset=$(grep -o '/ambiguous-3d-studio/assets/manifold-[A-Za-z0-9_-]*\.wasm' "$worker" | head -1)
+          echo "referenced wasm: $asset"
+          test -f "dist${asset#/ambiguous-3d-studio}" || {
+            echo "::error::referenced wasm asset is not present in dist/"
+            exit 1
+          }
+          echo "ok: wasm is emitted and referenced with the base prefix"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
