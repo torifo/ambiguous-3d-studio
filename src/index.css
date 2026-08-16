@@ -1,1 +1,49 @@
 @import 'tailwindcss';
+
+/*
+ * モバイルの土台（Task 7.1 / FR-026 / NFR-021）。
+ *
+ * アプリシェル（App.tsx）は `h-dvh` の 1 画面で、ページ自体はスクロール
+ * しない。スクロールするのはサイドバー / ボトムシートの中身だけ。
+ * 3D ビューポート上の 1 本指ドラッグは OrbitControls が `touch-action: none`
+ * で握るが、それだけでは足りない：
+ *
+ * - `overscroll-behavior: none` … シートの端まで scroll したあとの連鎖で
+ *   ページ全体（iOS のラバーバンド）が動くのを止める
+ * - `overflow: hidden` … アドレスバーの出入りで生じる 1px 単位の
+ *   スクロール可能領域を潰す。これが残ると、ドラッグのたびに画面が
+ *   数 px 上下して錯視の確認にならない
+ * - `#root { height: 100% }` … シェルの `h-dvh` を親から阻害しない
+ */
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  /* overflow は html にも置く。body だけに置くと「root の overflow が
+     visible なら body のものをビューポートへ伝播する」規則に依存することに
+     なり、規則の適用順で挙動が割れる。両方に置けば伝播元がどちらでも同じ */
+  html,
+  body {
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  body {
+    margin: 0;
+    -webkit-text-size-adjust: 100%;
+  }
+}
+
+/*
+ * セーフエリア（ノッチ / ホームインジケータ）を避ける内側余白（FR-026）。
+ * 通常時は 1rem（= p-4 相当）で、セーフエリアがそれより大きい端末だけ
+ * 押し広げる。`viewport-fit=cover`（index.html）と対で機能する。
+ */
+@utility pad-safe {
+  padding-left: max(1rem, env(safe-area-inset-left));
+  padding-right: max(1rem, env(safe-area-inset-right));
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}

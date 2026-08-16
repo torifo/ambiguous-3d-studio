@@ -13,14 +13,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   angleBetween,
+  clearLiveAngleSink,
   easeInOutCubic,
   matchedSweetSpot,
   orthoZoomToMatchPerspective,
   perspectiveDistanceToMatchOrtho,
   perspectiveHalfHeightAt,
+  publishLiveAngles,
+  setLiveAngleSink,
   slerpDirection,
   SNAP_VIEWS,
   SWEET_SPOT_THRESHOLD_RAD,
+  sweetSpotLiveAngles,
   useViewerStore,
   VIEW_FORWARDS,
   type Vec3Like,
@@ -271,5 +275,51 @@ describe('useViewerStore（書き込みは値の変化時のみ。NFR-002）', (
     expect(second).toEqual({ view: 'side', seq: 2 })
     // 参照同一性が変わる — CameraRig はこれで再スナップを検知する
     expect(second).not.toBe(first)
+  })
+})
+
+describe('連続角度の受け口（FR-021 / NFR-002 — Task 7.1）', () => {
+  beforeEach(() => {
+    sweetSpotLiveAngles.a = Math.PI
+    sweetSpotLiveAngles.b = Math.PI
+  })
+
+  it('publishLiveAngles は登録された購読へ現在値を渡す（store を経由しない）', () => {
+    const sink = vi.fn()
+    setLiveAngleSink(sink)
+    sweetSpotLiveAngles.a = 0.25
+    sweetSpotLiveAngles.b = 1.5
+
+    // store の購読者には一切通知されない = React の再レンダリングが起きない
+    const storeListener = vi.fn()
+    const unsubscribe = useViewerStore.subscribe(storeListener)
+    publishLiveAngles()
+    unsubscribe()
+
+    expect(sink).toHaveBeenCalledExactlyOnceWith(0.25, 1.5)
+    expect(storeListener).not.toHaveBeenCalled()
+    clearLiveAngleSink(sink)
+  })
+
+  it('購読が無ければ publishLiveAngles は何もしない（シーン単体・UI 未マウント）', () => {
+    expect(() => {
+      publishLiveAngles()
+    }).not.toThrow()
+  })
+
+  it('clearLiveAngleSink は自分が登録したものだけを外す（StrictMode の二重マウント対策）', () => {
+    const stale = vi.fn()
+    const current = vi.fn()
+    setLiveAngleSink(stale)
+    setLiveAngleSink(current) // 後勝ち
+    clearLiveAngleSink(stale) // 古い cleanup が後から届いても現行を消さない
+
+    publishLiveAngles()
+    expect(current).toHaveBeenCalledTimes(1)
+    expect(stale).not.toHaveBeenCalled()
+
+    clearLiveAngleSink(current)
+    publishLiveAngles()
+    expect(current).toHaveBeenCalledTimes(1)
   })
 })

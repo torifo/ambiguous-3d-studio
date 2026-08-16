@@ -78,13 +78,16 @@ export function SvgDropzone(props: SvgDropzoneProps) {
       <label htmlFor={props.inputId} className="mb-1 block text-[11px] text-neutral-400">
         SVG ファイルを選択
       </label>
+      {/* file:min-h-11 … ファイル選択ダイアログを開けるのは input のうち
+          ボタン部分だけなので、44px はボタン自身で満たす必要がある
+          （input 全体の高さでは代用にならない。FR-026） */}
       <input
         id={props.inputId}
         type="file"
         accept=".svg,image/svg+xml"
         aria-describedby={props.describedById}
         onChange={handleChange}
-        className="block w-full max-w-full text-[11px] text-neutral-300 file:mr-2 file:min-h-9 file:rounded file:border file:border-neutral-600 file:bg-neutral-800 file:px-2 file:py-1 file:text-neutral-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
+        className="block w-full max-w-full text-[11px] text-neutral-300 file:mr-2 file:min-h-11 file:rounded file:border file:border-neutral-600 file:bg-neutral-800 file:px-3 file:py-1 file:text-neutral-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
       />
       {props.currentFileName !== null && (
         <p className="mt-2 text-[11px] break-all text-neutral-400">

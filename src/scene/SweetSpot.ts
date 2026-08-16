@@ -237,6 +237,42 @@ export function perspectiveDistanceToMatchOrtho(
  */
 export const sweetSpotLiveAngles = { a: Math.PI, b: Math.PI }
 
+/**
+ * 連続表示の書き出し先（FR-021「カメラが動いている間、角度差をリアルタイムに
+ * 表示する」の配線点）。毎フレーム呼ばれる関数を 1 つだけ保持する受け口で、
+ * **store でも React state でもない** — ここを経由しても再レンダリングは
+ * 1 回も起きない（NFR-002: 60fps 予算をレンダリングに使わない）。
+ *
+ * 実際に DOM へ書くのは ui 側の購読者（SweetSpotIndicator）で、このファイルは
+ * DOM にも three にも依存しないまま保つ（冒頭の不変条件）。
+ */
+export type LiveAngleSink = (angleA: number, angleB: number) => void
+
+let liveAngleSink: LiveAngleSink | null = null
+
+/** 連続表示の購読を登録する。保持できるのは 1 つだけで、後勝ち */
+export function setLiveAngleSink(sink: LiveAngleSink): void {
+  liveAngleSink = sink
+}
+
+/**
+ * 登録した購読を解除する。**自分が登録したものだけ**を外す —
+ * StrictMode の二重マウント（mount → cleanup → mount）で、後から登録された
+ * 購読を古い cleanup が消してしまう事故を防ぐ。
+ */
+export function clearLiveAngleSink(sink: LiveAngleSink): void {
+  if (liveAngleSink === sink) liveAngleSink = null
+}
+
+/**
+ * 現在の角度差を購読者へ流す。`useFrame` の中から毎フレーム呼ぶ（Viewport）。
+ * 未登録なら何もしない（シーンだけを単体で動かす場合や、UI 未マウント時）。
+ */
+export function publishLiveAngles(): void {
+  if (liveAngleSink === null) return
+  liveAngleSink(sweetSpotLiveAngles.a, sweetSpotLiveAngles.b)
+}
+
 /** UI からのスナップ要求。同じ視点の連打を区別するため単調な seq を持つ */
 export interface SnapRequest {
   view: SnapView

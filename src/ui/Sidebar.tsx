@@ -40,6 +40,7 @@ import {
   type RealWorldSizeMm,
 } from '../studio/scale'
 import { WORKING_HEIGHT, type GeometryRef } from '../studio/useGenerationPipeline'
+import { ExportPanel } from './ExportPanel'
 import { SilhouettePicker } from './SilhouettePicker'
 import { StatusBanner } from './StatusBanner'
 import { SweetSpotIndicator, type SweetSpotIndicatorProps } from './SweetSpotIndicator'
@@ -52,10 +53,13 @@ const BUTTON_CLASS =
 const CHECKBOX_CLASS =
   'h-4 w-4 shrink-0 accent-sky-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400'
 
-/** Sweet Spot 未配線時の表示（未計測）。シーン接続後に実値が流れ込む */
+/**
+ * Sweet Spot 未配線時の表示（未計測）。シーン接続後に実値が流れ込む。
+ * 角度差の数値は props ではなく scene 側の `useFrame` が DOM を直接
+ * 更新する（SweetSpotIndicator.tsx / FR-021 / NFR-002）。
+ */
 const NO_SWEET_SPOT: SweetSpotIndicatorProps = {
   target: null,
-  angleDiffDeg: null,
   matched: false,
 }
 
@@ -226,7 +230,15 @@ export function Sidebar({
   const sizes = useRealWorldSize(geometryRef, options.heightMm)
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto p-4">
+    /*
+      768px 未満ではこの枠がボトムシートの中身になる（App.tsx がシェルの
+      向きを切り替える）。ここで効かせるのは 2 つ（FR-026 / Task 7.1）：
+      - `pad-safe` … 左右下のセーフエリアを避けた内側余白（index.css）。
+        ホームインジケータの上に「リセット」ボタンが潜り込むのを防ぐ
+      - `overscroll-contain` … シートを端までスクロールしたあとの連鎖で
+        背後のページが動かないようにする（1 本指ドラッグの誤スクロール防止）
+    */
+    <div className="pad-safe flex h-full flex-col gap-4 overflow-y-auto overscroll-contain pt-4">
       <h1 className="text-sm font-semibold tracking-wide text-neutral-100">
         Ambiguous 3D Studio
       </h1>
@@ -369,7 +381,15 @@ export function Sidebar({
             視点スナップは 3D ビューポート接続後に有効になります。
           </p>
         )}
+        {/* FR-027: ズームだけはボタンではなくキー操作で提供する（実装は
+            scene/Viewport.tsx）。到達方法が分からないと使えないので明示する */}
+        <p className="text-[10px] text-neutral-500">
+          3D ビューにフォーカスを移すと ＋ / − キーでズームできます。
+        </p>
       </section>
+
+      {/* 書き出し（FR-030 / FR-031）。ジオメトリ ref を渡す — ADR-004 */}
+      <ExportPanel geometryRef={geometryRef} />
 
       <section aria-labelledby={`${baseId}-reset-heading`} className="flex flex-col gap-1.5">
         <h2 id={`${baseId}-reset-heading`} className="text-xs font-semibold text-neutral-200">

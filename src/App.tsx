@@ -10,33 +10,28 @@
  * - カメラ操作 … `useViewerStore.requestSnap`（UI → scene）
  * - 合致状態 … `useViewerStore.matched`（scene → UI）
  */
-import { useCallback } from 'react'
+import { useCallback, useMemo } from 'react'
 
 import { Sidebar } from './ui/Sidebar'
 import { Viewport } from './scene/Viewport'
-import { useViewerStore, sweetSpotLiveAngles, type SnapView } from './scene/SweetSpot'
+import { useViewerStore, type SnapView } from './scene/SweetSpot'
 import { useGenerationPipeline } from './studio/useGenerationPipeline'
 
 /**
  * 合致状態を SweetSpotIndicator の props に変換する。
  *
  * `matched` は**離散イベント**（合致した / 外れた）なので購読してよい。
- * 一方 `sweetSpotLiveAngles` は毎フレーム更新されるため、React state に
- * 載せると 60fps ぶんの再レンダリングが発生し NFR-002 を壊す。ここでは
- * 合致が変化した時点の値をサンプリングするに留める。
- *
- * 連続的な角度表示（FR-021 の「リアルタイムに表示」）は、React を経由せず
- * DOM を直接更新する必要がある。scene 側が `sweetSpotLiveAngles` を
- * 非リアクティブに公開しているのはそのためで、配線はまだ入れていない。
+ * 一方、毎フレーム変わる角度差（`sweetSpotLiveAngles`）は React state にも
+ * props にも載せない — 載せると 60fps ぶんの再レンダリングが発生し
+ * NFR-002 を壊す。FR-021 の「リアルタイム表示」は Viewport の `useFrame` が
+ * インジケーターの DOM ノードへ直接書き込む経路で満たしてある
+ * （scene/SweetSpot.ts の `setLiveAngleSink` / ui/SweetSpotIndicator.tsx）。
+ * したがってこのフックが返すのは**離散状態だけ**であり、カメラを動かしても
+ * 合致が切り替わらない限り再レンダリングは 1 回も起きない。
  */
 function useSweetSpotProps() {
   const matched = useViewerStore((s) => s.matched)
-  const angleRad = matched === 'A' ? sweetSpotLiveAngles.a : sweetSpotLiveAngles.b
-  return {
-    target: matched,
-    angleDiffDeg: matched === null ? null : (angleRad * 180) / Math.PI,
-    matched: matched !== null,
-  }
+  return useMemo(() => ({ target: matched, matched: matched !== null }), [matched])
 }
 
 function App() {
@@ -49,10 +44,24 @@ function App() {
   const handleResetView = useCallback(() => requestSnap('iso'), [requestSnap])
 
   return (
-    <div className="flex h-screen bg-neutral-950 text-neutral-100">
+    /*
+      レイアウト（FR-026 / Task 7.1）。**モバイルが既定**で、768px 以上
+      （Tailwind の `md:`）から従来の 2 カラムに戻る：
+
+      - 〜767px: `flex-col-reverse` の縦積み。DOM 順は aside → main のまま
+        （キーボードと支援技術は先にコントロールへ入る）だが、描画はサイド
+        バーが下端の**ボトムシート**になる。高さは 45dvh に固定し、3D
+        ビューポートに 55dvh —「画面の過半」を渡す
+      - 768px〜: 左 320px のサイドバー + 残り全部のビューポート（従来どおり）
+
+      高さの単位は `dvh`。iOS Safari の `vh` は URL バーが隠れている前提の
+      値なので、`100vh` だとツールバー表示時にシート下端が画面外へ潜り、
+      セーフエリア回避（FR-026）ごと無効になる。
+    */
+    <div className="flex h-dvh flex-col-reverse overflow-hidden bg-neutral-950 text-neutral-100 md:flex-row">
       <aside
         aria-label="コントロールサイドバー"
-        className="w-80 shrink-0 border-r border-neutral-800"
+        className="h-[45dvh] w-full shrink-0 border-t border-neutral-800 md:h-full md:w-80 md:border-t-0 md:border-r"
       >
         <Sidebar
           onRetryInit={retry}
@@ -62,7 +71,7 @@ function App() {
           sweetSpot={sweetSpot}
         />
       </aside>
-      <main aria-label="3D ビューポート" className="min-w-0 flex-1">
+      <main aria-label="3D ビューポート" className="min-h-0 min-w-0 flex-1">
         <Viewport geometryRef={geometryRef} />
       </main>
     </div>
