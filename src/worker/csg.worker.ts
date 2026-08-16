@@ -50,6 +50,21 @@ import type { CsgError, CsgRequest, CsgResponse, WorkerOutbound } from './protoc
 /** 押し出し深さのマージン（design.md「2. 押し出し深さ」。深さ算出自体は studio/ 側の責務） */
 export const DEPTH_MARGIN = 0.02
 
+/** 台座フットプリントの拡大率（FR-015: 立体の XZ バウンディングボックス × 1.15） */
+export const BASEPLATE_FOOTPRINT_SCALE = 1.15
+
+/**
+ * 台座の接触許容（FR-015「立体の最小 Y から 0.1mm 以内」）を**厚みに対する
+ * 比率**で表した値 = 0.1mm / 既定厚 2.0mm。
+ *
+ * Worker 境界（protocol.ts）は作業座標系しか運ばず（`baseplate.height` は
+ * 変換済みの厚みのみ）、mm ⇄ 作業座標の倍率をここでは知り得ない。そこで
+ * mm 同士の比として表す：既定厚 2.0mm のとき正確に 0.1mm、厚み範囲の両端
+ * （0.5〜5.0mm）では 0.025〜0.25mm に比例変動する。正確な 0.1mm が全域で
+ * 必要になったら、プロトコルに作業座標の接触許容フィールドを追加すること。
+ */
+export const BASEPLATE_CONTACT_RATIO = 0.1 / 2.0
+
 /** `delete()` を持つ Wasm 所有オブジェクトの共通形 */
 interface WasmHandle {
   delete(): void
@@ -102,8 +117,13 @@ function messageOf(err: unknown): string {
  * 4. `prismA.intersect(prismB)`
  * 5. `status() !== 'NoError'` で破棄（文字列リテラル比較 — `NoError` という
  *    識別子は存在しない。ADR-006）
- * 6. `decompose()` が連結成分数の唯一の確定根拠（プリフライトは推定のみ）
- * 7. `getMesh()` の配列は Wasm 管理メモリを指しうるため、
+ * 6. 台座（FR-015 / Task 6.4）が有効なら、交差結果の bbox から台座を組み
+ *    `solid.add(plate)` で**この Worker 内で**結合する（メインスレッドで
+ *    結合するとマニホールド保証が切れる — design.md「台座」）
+ * 7. `decompose()` が連結成分数の唯一の確定根拠（プリフライトは推定のみ）。
+ *    台座有効時は**結合後の立体**を decompose する — 最小 Y に届かない成分は
+ *    台座に接続されず、結合後も 2 以上が残り得る（それを正直に報告する）
+ * 8. `getMesh()` の配列は Wasm 管理メモリを指しうるため、
  *    **新規 typed array にコピーしてから**返す
  *
  * 深さの防御的検証：深さの**算出**は studio 側（Wave 4）の責務だが、対向
@@ -112,7 +132,7 @@ function messageOf(err: unknown): string {
  * `a.depth >= width(B) × (1 + DEPTH_MARGIN)`（および対称に b）を検証し、
  * 不足は `INVALID_INPUT` で不足量を明示して拒否する。
  *
- * エラー分類：入力起因（輪郭検証・深さ・未実装オプション）は `INVALID_INPUT`、
+ * エラー分類：入力起因（輪郭検証・深さ・台座厚）は `INVALID_INPUT`、
  * エンジンが不正メッシュを報告したら `NOT_MANIFOLD`（detail に `status()` の
  * 文字列をそのまま載せる）、交差が空なら `EMPTY_RESULT`。
  */
@@ -124,12 +144,13 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
     error,
   })
 
-  if (request.baseplate !== null && request.baseplate.enabled) {
-    // 台座は Task 6.4。有効化されたリクエストを黙って無視する（台座なしで返す）
-    // より、明示的に拒否する方が事故が見える
+  // 台座（FR-015）。enabled: false は null と同じ「無効」として正規化する
+  const baseplate =
+    request.baseplate !== null && request.baseplate.enabled ? request.baseplate : null
+  if (baseplate !== null && (!Number.isFinite(baseplate.height) || baseplate.height <= 0)) {
     return fail({
       code: 'INVALID_INPUT',
-      detail: 'baseplate is not implemented yet (Task 6.4)',
+      detail: `baseplate.height must be a positive finite number (got ${baseplate.height})`,
     })
   }
   if (!Number.isFinite(request.a.depth) || request.a.depth <= 0) {
@@ -146,8 +167,8 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
   }
 
   // 生成される Wasm オブジェクトの全量を個別変数で保持する（チェーン禁止）。
-  // 台座実装時（Task 6.4）は plate / withPlate をこの並びに追加し、
-  // finally の破棄順にも同じ位置（生成の逆順）で組み込むこと。
+  // 台座（Task 6.4）の plateBox / plate / based も同じ規律：宣言と生成を
+  // この並び（生成順）に揃え、finally では生成の逆順で破棄する。
   let sectionA: CrossSection | null = null
   let sectionB: CrossSection | null = null
   let rawA: Manifold | null = null
@@ -156,6 +177,9 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
   let centeredB: Manifold | null = null
   let prismB: Manifold | null = null
   let solid: Manifold | null = null
+  let plateBox: Manifold | null = null
+  let plate: Manifold | null = null
+  let based: Manifold | null = null
   let parts: Manifold[] | null = null
 
   try {
@@ -217,15 +241,68 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
       return fail({ code: 'EMPTY_RESULT' })
     }
 
-    // 連結成分数の唯一の確定根拠。戻り配列の各要素も個別の Wasm オブジェクト
-    parts = solid.decompose()
+    // --- 台座（FR-015 / Task 6.4）---
+    // 結合は必ずこの Worker 内で行う（メインスレッドで結合するとマニホールド
+    // 保証が切れる — design.md「台座」）。空交差の判定より**後**に置く：
+    // 交差が空なのに台座だけの「立体」を返すと EMPTY_RESULT が隠蔽される。
+    //
+    // フットプリントは交差結果の XZ bbox × BASEPLATE_FOOTPRINT_SCALE。厚みは
+    // 下方向へ伸ばし（FR-029: 実寸高さに台座厚は含めない）、上面だけ contact
+    // ぶん最小 Y に食い込ませる — 最小 Y から contact 以内に達している成分
+    // だけが台座と融合する（= FR-015 の接触判定を結合そのもので実装する）。
+    //
+    // メモリ規律：`boundingBox()` は manifold.js が embind 値を変換した素の
+    // JS オブジェクト（{min, max} の数値配列）で、Wasm ハンドルではない —
+    // 追跡不要。`cube` / `translate` / `add` は manifold.js 実装を確認済みで、
+    // いずれも内部チェーンのない単一オブジェクト生成（冒頭「メモリ規律」の
+    // 確認義務に基づく。extrude の center: true のような内部 translate はない）
+    if (baseplate !== null) {
+      const bounds = solid.boundingBox()
+      const thickness = baseplate.height
+      const contact = thickness * BASEPLATE_CONTACT_RATIO
+      const footprintX = (bounds.max[0] - bounds.min[0]) * BASEPLATE_FOOTPRINT_SCALE
+      const footprintZ = (bounds.max[2] - bounds.min[2]) * BASEPLATE_FOOTPRINT_SCALE
+      const centerX = (bounds.min[0] + bounds.max[0]) / 2
+      const centerZ = (bounds.min[2] + bounds.max[2]) / 2
+
+      plateBox = track(
+        wasm.Manifold.cube([footprintX, thickness + contact, footprintZ], false),
+      )
+      plate = track(
+        plateBox.translate([
+          centerX - footprintX / 2,
+          bounds.min[1] - thickness,
+          centerZ - footprintZ / 2,
+        ]),
+      )
+      based = track(solid.add(plate))
+
+      const basedStatus = based.status()
+      if (basedStatus !== 'NoError') {
+        return fail({
+          code: 'NOT_MANIFOLD',
+          detail: `Manifold.status() returned '${basedStatus}' after baseplate union`,
+        })
+      }
+    }
+
+    // 台座有効時は結合後の立体が出力対象（decompose / volume / getMesh の全て）。
+    // `output` は solid / based いずれかへの**別名**であり新規 Wasm オブジェクト
+    // ではない — 解放は finally の個別変数（solid / based）でのみ行う
+    const output: Manifold = based ?? solid
+
+    // 連結成分数の唯一の確定根拠。台座有効時は**結合後に再度** decompose した
+    // 結果を報告する（FR-015: 最小 Y に届かない成分は台座に接続されないため、
+    // 台座を付けても 1 にならないことがある — その事実をそのまま返す）。
+    // 戻り配列の各要素も個別の Wasm オブジェクト
+    parts = output.decompose()
     for (const part of parts) {
       track(part)
     }
     const componentCount = parts.length
-    const volume = solid.volume()
+    const volume = output.volume()
 
-    const mesh = solid.getMesh()
+    const mesh = output.getMesh()
     if (mesh.numProp !== 3) {
       // CrossSection 由来の Manifold はプロパティを持たないので常に 3 のはず。
       // 破れたらエンジンとの契約違反として扱う
@@ -251,13 +328,18 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
     // Wasm バインディング境界の予期しない失敗。詳細をそのまま診断情報に載せる
     return fail({ code: 'INVALID_INPUT', detail: messageOf(err) })
   } finally {
-    // 生成の逆順に破棄：parts[]（逆順）→ solid → prismB → centeredB → prismA
-    // → rawB → rawA → sectionB → sectionA。decompose() の戻り配列が最も漏れやすい
+    // 生成の逆順に破棄：parts[]（逆順）→ based → plate → plateBox → solid
+    // → prismB → centeredB → prismA → rawB → rawA → sectionB → sectionA。
+    // decompose() の戻り配列が最も漏れやすい。台座なしの経路では
+    // based / plate / plateBox は null のままで release は no-op
     if (parts !== null) {
       for (let i = parts.length - 1; i >= 0; i--) {
         release(parts[i])
       }
     }
+    release(based)
+    release(plate)
+    release(plateBox)
     release(solid)
     release(prismB)
     release(centeredB)

@@ -4,7 +4,13 @@ import type { ManifoldToplevel } from 'manifold-3d'
 import { boundsOf } from '../geometry/normalize'
 import { presetToContours } from '../sources/presets'
 import type { CsgRequest, SerializedContour } from './protocol'
-import { DEPTH_MARGIN, getLiveWasmObjectCount, performCsg } from './csg.worker'
+import {
+  BASEPLATE_CONTACT_RATIO,
+  BASEPLATE_FOOTPRINT_SCALE,
+  DEPTH_MARGIN,
+  getLiveWasmObjectCount,
+  performCsg,
+} from './csg.worker'
 
 /**
  * CSG Worker の統合テスト（Task 3.1）。実物の manifold-3d Wasm を Node 上で
@@ -116,6 +122,22 @@ function makeRequest(
     b: { contours: bContours, depth: widthA * (1 + DEPTH_MARGIN) },
     baseplate: null,
   }
+}
+
+/** 頂点配列の bbox（[minX, minY, minZ] / [maxX, maxY, maxZ]）。台座の実体検証用 */
+function boundsOfPositions(positions: Float32Array): {
+  min: [number, number, number]
+  max: [number, number, number]
+} {
+  const min: [number, number, number] = [Infinity, Infinity, Infinity]
+  const max: [number, number, number] = [-Infinity, -Infinity, -Infinity]
+  for (let i = 0; i < positions.length; i += 3) {
+    for (let axis = 0; axis < 3; axis++) {
+      min[axis] = Math.min(min[axis], positions[i + axis])
+      max[axis] = Math.max(max[axis], positions[i + axis])
+    }
+  }
+  return { min, max }
 }
 
 /** 成功レスポンスの共通妥当性（配列形状とインデックス範囲） */
@@ -289,16 +311,133 @@ describe('worker/csg (integration with real manifold-3d)', () => {
     expect(getLiveWasmObjectCount()).toBe(0)
   })
 
-  it('baseplate-enabled request is rejected until Task 6.4', () => {
-    const request: CsgRequest = {
-      ...makeRequest([squareContour(2)], [squareContour(2)]),
-      baseplate: { enabled: true, height: 0.2 },
-    }
-    const response = performCsg(wasm, request)
-    expect(response.ok).toBe(false)
-    if (response.ok) return
-    expect(response.error.code).toBe('INVALID_INPUT')
-    expect(getLiveWasmObjectCount()).toBe(0)
+  describe('baseplate (FR-015 / Task 6.4)', () => {
+    /** 作業座標系の台座厚（プロトコルは mm を運ばない — protocol.ts 参照） */
+    const PLATE_HEIGHT = 0.2
+
+    it('square × circle + baseplate → NoError, fused into a single component, plate present in the mesh', () => {
+      // 正方形 × 円の交差（X 軸方向の円柱、半径 1・長さ 2）は最小 Y (= −1) に
+      // 達する成分 1 個だけなので、台座と融合して単一パーツになる
+      const request: CsgRequest = {
+        ...makeRequest(
+          [squareContour(2)],
+          [circleContour(1, CIRCLE_SEGMENTS, true, false)],
+        ),
+        baseplate: { enabled: true, height: PLATE_HEIGHT },
+      }
+      const response = performCsg(wasm, request)
+      // performCsg は status() === 'NoError'（結合後の再検証を含む）のときだけ ok: true
+      expect(response.ok).toBe(true)
+      if (!response.ok) return
+      expect(response.componentCount).toBe(1)
+      assertMeshShape(response.positions, response.indices)
+      // 融合した箱＋円柱は穴のない単一立体（genus 0）
+      expect(genusOf(response.positions, response.indices)).toBe(0)
+
+      // 台座の実体を bbox で検証する：
+      // - フットプリント = 立体の XZ bbox（±1）× 1.15 → ±1.15
+      // - 厚みは下方向（FR-029: 実寸高さに台座厚は含めない）→ minY = −1 − 0.2
+      const { min, max } = boundsOfPositions(response.positions)
+      expect(min[0]).toBeCloseTo(-1 * BASEPLATE_FOOTPRINT_SCALE, 5)
+      expect(max[0]).toBeCloseTo(1 * BASEPLATE_FOOTPRINT_SCALE, 5)
+      expect(min[2]).toBeCloseTo(-1 * BASEPLATE_FOOTPRINT_SCALE, 5)
+      expect(max[2]).toBeCloseTo(1 * BASEPLATE_FOOTPRINT_SCALE, 5)
+      expect(min[1]).toBeCloseTo(-1 - PLATE_HEIGHT, 5)
+      expect(max[1]).toBeCloseTo(1, 5)
+
+      // 体積 ≈ 円柱 (2π) ＋ 台座 (2.3 × 2.3 × (厚み + 食い込み))。
+      // 食い込み分の重複（円柱の最下帯 ≈ 0.004）は許容 1% に含まれる
+      const plateVolume =
+        2.3 * 2.3 * (PLATE_HEIGHT * (1 + BASEPLATE_CONTACT_RATIO))
+      const expected = Math.PI * 1 * 1 * 2 + plateVolume
+      expect(Math.abs(response.volume - expected) / expected).toBeLessThan(0.01)
+
+      expect(getLiveWasmObjectCount()).toBe(0)
+    })
+
+    it('a component that never reaches the global minimum Y stays disconnected after the union', () => {
+      // 意図的に分離する入力：A = 正方形、B = 上下に離れた 2 つの小正方形。
+      // 交差は y ∈ [−1, −0.4] と y ∈ [0.4, 1] の 2 スラブになり、
+      // 全体の最小 Y (= −1) に達するのは下スラブだけ。台座は下スラブとしか
+      // 融合できず、上スラブは浮いたまま — 台座は 1 パーツを保証しない
+      // （FR-015 / design.md「台座」）。componentCount はその事実を隠さない
+      const twoBands = [
+        squareContour(0.6, 0, -0.7),
+        squareContour(0.6, 0, 0.7),
+      ]
+
+      const bare = performCsg(wasm, makeRequest([squareContour(2)], twoBands))
+      expect(bare.ok).toBe(true)
+      if (!bare.ok) return
+      expect(bare.componentCount).toBe(2)
+
+      const based = performCsg(wasm, {
+        ...makeRequest([squareContour(2)], twoBands),
+        baseplate: { enabled: true, height: PLATE_HEIGHT },
+      })
+      expect(based.ok).toBe(true)
+      if (!based.ok) return
+      // 結合後の再 decompose が正直に 2 を報告する（1 に「なったこと」に
+      // されない）。台座 + 下スラブで 1 成分、浮いた上スラブで 1 成分
+      expect(based.componentCount).toBe(2)
+
+      // 台座は実在する（数え漏れで 2 なのではない）：bbox が下方向に厚み分
+      // 伸び、体積が台座なしより増えている
+      const { min } = boundsOfPositions(based.positions)
+      expect(min[1]).toBeCloseTo(-1 - PLATE_HEIGHT, 5)
+      expect(based.volume).toBeGreaterThan(bare.volume)
+
+      expect(getLiveWasmObjectCount()).toBe(0)
+    })
+
+    it('baseplate with enabled: false behaves exactly as no baseplate', () => {
+      const withNull = performCsg(
+        wasm,
+        makeRequest([squareContour(2)], [circleContour(1, CIRCLE_SEGMENTS, true, false)]),
+      )
+      const withDisabled = performCsg(wasm, {
+        ...makeRequest(
+          [squareContour(2)],
+          [circleContour(1, CIRCLE_SEGMENTS, true, false)],
+        ),
+        baseplate: { enabled: false, height: PLATE_HEIGHT },
+      })
+      expect(withNull.ok).toBe(true)
+      expect(withDisabled.ok).toBe(true)
+      if (!withNull.ok || !withDisabled.ok) return
+      expect(withDisabled.volume).toBe(withNull.volume)
+      expect(withDisabled.componentCount).toBe(withNull.componentCount)
+      expect(boundsOfPositions(withDisabled.positions).min[1]).toBeCloseTo(-1, 5)
+      expect(getLiveWasmObjectCount()).toBe(0)
+    })
+
+    it('non-finite or non-positive plate height → INVALID_INPUT, no leak', () => {
+      for (const height of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const response = performCsg(wasm, {
+          ...makeRequest([squareContour(2)], [squareContour(2)]),
+          baseplate: { enabled: true, height },
+        })
+        expect(response.ok).toBe(false)
+        if (response.ok) return
+        expect(response.error.code).toBe('INVALID_INPUT')
+        if (response.error.code !== 'INVALID_INPUT') return
+        expect(response.error.detail).toMatch(/baseplate\.height/)
+        expect(getLiveWasmObjectCount()).toBe(0)
+      }
+    })
+
+    it('empty intersection with baseplate enabled still reports EMPTY_RESULT (no floating plate)', () => {
+      // 空判定は台座結合より前 — 交差が空なのに台座だけの「立体」を
+      // 成功として返してはならない
+      const response = performCsg(wasm, {
+        ...makeRequest([squareContour(2)], [squareContour(2, 0, 10)]),
+        baseplate: { enabled: true, height: PLATE_HEIGHT },
+      })
+      expect(response.ok).toBe(false)
+      if (response.ok) return
+      expect(response.error.code).toBe('EMPTY_RESULT')
+      expect(getLiveWasmObjectCount()).toBe(0)
+    })
   })
 
   it('depth shorter than the opposing silhouette width → INVALID_INPUT, not a clipped solid', () => {
@@ -387,7 +526,9 @@ describe('worker/csg (integration with real manifold-3d)', () => {
     //     Emscripten のヒープは delete() しても**縮まない**ため、容量の減少を
     //     要求する形は必ず偽陽性になる — 見るのは「増えないこと」だけ
     //
-    // 成功パスと EMPTY_RESULT パスを混ぜて finally の破棄経路を両方通す。
+    // 成功・EMPTY_RESULT・台座（Task 6.4）の 3 経路を混ぜて finally の破棄
+    // 経路をすべて通す — 台座パスは plateBox / plate / based の 3 オブジェクト
+    // が追加で生成されるため、そこの解放漏れもこのテストの監視対象。
     // 円の分割数を上げてリーク 1 件あたりのサイズを稼ぎ、もしリークが再発したら
     // ヒープ成長が許容値を確実に超えるようにする
     const memory = wasmMemory
@@ -404,19 +545,22 @@ describe('worker/csg (integration with real manifold-3d)', () => {
       [circleContour(1, LEAK_TEST_SEGMENTS, true, false)],
     )
     const empty = makeRequest([squareContour(2)], [squareContour(2, 0, 10)])
+    const baseplated: CsgRequest = {
+      ...makeRequest(
+        [squareContour(2)],
+        [circleContour(1, LEAK_TEST_SEGMENTS, true, false)],
+      ),
+      baseplate: { enabled: true, height: 0.2 },
+    }
 
     const runGeneration = (generation: number): void => {
-      const request: CsgRequest = {
-        ...(generation % 2 === 0 ? empty : success),
-        generation,
-      }
+      const variant = generation % 3
+      const source = variant === 0 ? empty : variant === 1 ? success : baseplated
+      const request: CsgRequest = { ...source, generation }
       const response = performCsg(wasm, request)
       expect(response.generation).toBe(generation)
-      if (generation % 2 === 0) {
-        expect(response.ok).toBe(false)
-      } else {
-        expect(response.ok).toBe(true)
-      }
+      // variant 0 = 空交差（失敗パス）、1 = 成功、2 = 台座付き成功
+      expect(response.ok).toBe(variant !== 0)
       expect(getLiveWasmObjectCount()).toBe(0)
     }
 

@@ -22,6 +22,7 @@ import type { GeometryRef } from '../studio/useGenerationPipeline'
 import { CameraRig } from './CameraRig'
 import { SNAP_VIEWS } from './SweetSpot'
 import { SolidMesh } from './SolidMesh'
+import { VirtualMirror } from './VirtualMirror'
 
 export interface ViewportProps {
   /** 生成パイプライン（useGenerationPipeline）が公開するジオメトリ参照 */
@@ -79,6 +80,10 @@ export function Viewport(props: ViewportProps) {
         infiniteGrid
       />
       <SolidMesh geometryRef={props.geometryRef} />
+      {/* 仮想ミラー（Task 6.3 / FR-024）。有効/無効のゲート（store の
+          virtualMirror 購読）と反射ターゲットの解放は VirtualMirror 側が
+          持つ — Viewport は store を購読しない、という冒頭の不変条件を保つ */}
+      <VirtualMirror />
       <CameraRig />
     </Canvas>
   )
