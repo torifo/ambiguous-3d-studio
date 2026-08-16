@@ -41,14 +41,54 @@
  *
  * ## 配置（オフセットは独立パラメータ。FR-102 拡張）
  *
- * 位置は「原点からの法線距離を軸角によらず一定（`mirrorOffset/√2`）に保つ」
- * ことで求める。有限矩形の反射面のうち原点にもっとも近い点は常にこの法線
- * 距離と一致するため、立体（半径 ~1.5 程度）との交差を軸角によらず避け
- * られる。`mirrorOffset` はユーザー（ui/Sidebar.tsx）・カタログ項目
- * （catalogue/illusions.ts の `IllusionPreset.mirror.offset` →
- * `store/useStudioStore.ts` の `options.mirrorOffset`）のどちらからも
- * 設定できる — 「どちらを向くか」（向き）は錯視の成立条件そのものなので
- * 固定し、「どれだけ離すか」（オフセット）だけを自由パラメータにする。
+ * 平面の**原点からの法線距離**は軸角によらず一定（`mirrorOffset/√2` —
+ * 以下 `distance`）に保つ。有限矩形のどの点も、この法線距離**以上**
+ * 原点から離れる（後述のスライドを含めても、この事実は変わらない）ため、
+ * 立体（半径 ~1.5 程度）との交差を軸角によらず避けられる。`mirrorOffset`
+ * はユーザー（ui/Sidebar.tsx）・カタログ項目（catalogue/illusions.ts の
+ * `IllusionPreset.mirror.offset` → `store/useStudioStore.ts` の
+ * `options.mirrorOffset`）のどちらからも設定できる — 「どちらを向くか」
+ * （向き）は錯視の成立条件そのものなので固定し、「どれだけ離すか」
+ * （オフセット）だけを自由パラメータにする。
+ *
+ * **矩形の中心は「原点にもっとも近い点」ではなく「原点の鏡像に画面 X が
+ * 一致する点」に置く**（レビュー Finding 1 の修正。以前は前者だった —
+ * 45° 等の斜交軸で反射像が矩形の外に落ち、鏡が黒いまま何も映さない
+ * 欠陥があった）。理由：
+ *
+ * 1. Reflector は実カメラを鏡面で鏡映した仮想カメラでシーンを描画し、
+ *    実カメラと**同じフラスタム**（zoom / 投影）を使ってそれを鏡の矩形へ
+ *    投影する。したがって「点 X が鏡に映って見えるか」は「X を鏡面で
+ *    鏡映した点 X′ の**画面 XY 座標**が、鏡の矩形自身の画面 XY 範囲に
+ *    含まれるか」と同値になる（等長変換の性質 — 仮想カメラから X を見る
+ *    のと、実カメラから X′ を見るのとで、画面上の局所座標が一致する）。
+ *    視点 A のカメラは常に画面右 = world +X・画面上 = world +Y なので、
+ *    「画面 XY 座標」は world X・Y そのもの。
+ * 2. 原点を鏡映した点 X′ は `2·foot`（`foot` は原点から平面への垂線の足）
+ *    — 鏡映の定義そのもの（`O′ = O − 2((O−foot)·n)n`、`(O−foot)·n = −distance`
+ *    より `O′ = 2·distance·n`... 符号を追うと `O′ = 2·foot`）。
+ *    一方 `foot` 自身の world X は `distance` の何倍かでしかない
+ *    （軸角に依存する係数）。**`foot` を矩形の中心に選ぶと（旧実装）、
+ *    中心の world X は `foot.x` だが反射像の world X は `2·foot.x` —
+ *    2 倍のずれが生まれ、軸角が直交から離れるほど（`foot.x` が育つほど）
+ *    このずれが致命的になる**。既定 90° だけ偶然ずれが小さかったのは、
+ *    その角度でたまたま「反射像の world X」＝「矩形の world X」が別の
+ *    式（後述の従来ハードコード値）で一致していたため。
+ * 3. 修正：中心を `foot` から**平面の接線（矩形の幅方向）に沿って**
+ *    スライドし、中心の world X が反射像の world X（`2·foot.x`）に一致
+ *    するところまで動かす。接線方向のスライドは法線距離を変えない
+ *    （幅方向は定義より法線と直交する）ので、上記の交差回避はそのまま
+ *    保たれる。既定 90°（`rotationY = −45°`）でこの式を解くと厳密に
+ *    `(mirrorOffset, center_y, 0)` になる — **従来のハードコード値と
+ *    1 ビットも変わらない**（{@link mirrorTransform} の分岐はこれを
+ *    厳密値のまま返すための最適化であって、別の配置規約ではない）。
+ *
+ * これでもなお、矩形の**半幅**（`(MIRROR_WIDTH/2)·|cos(rotationY)|`。
+ * 軸角が直交から離れるほど前傾して画面上では細く見える — 遠近感のない
+ * 正射影でも生じる純粋な幾何学的前縮み）が反射像の半幅より狭ければ、
+ * 反射像は矩形の縁で欠ける（Finding 1 の 4 点目）。{@link MIRROR_WIDTH}
+ * の値はこの前縮みを見込んで、カタログが使う軸角（45°・90°）の両方で
+ * 欠けが実用上気にならない値を選んである。
  *
  * ## カタログ項目による自動設定
  *
@@ -108,12 +148,23 @@ import { DEFAULT_AXIS_ANGLE_DEG, viewpointCamera } from '../worker/protocol'
 export const MIRROR_OFFSET = DEFAULT_MIRROR_OFFSET
 
 /**
- * 反射面の幅（作業座標）。鏡の中の B 像は、ミラー面のローカル X 座標
- * −√2·bx（bx は B の作業座標 X、既定軸角の場合）を横切る。プリセットの
- * |bx| ≤ ~1.05 に対し半幅 1.8 ≥ √2 × 1.05 ≈ 1.49 で全体を覆う（幅広の
- * テキスト・SVG や大きく傾いた軸角ではみ出しうる — 固定サイズの既知の簡略化）。
+ * 反射面の幅（作業座標）。
+ *
+ * 鏡に映る像の実効半幅は、矩形自身のローカル半幅
+ * `(MIRROR_WIDTH/2)·|cos(rotationY)|` で決まる — 正射影でも、鏡面を
+ * 画面の正面方向（視点 A の +Z）から見た角度が直交から離れるほど、矩形は
+ * 前縮みして画面上で細く見える（ファイル冒頭「配置」参照。遠近感とは
+ * 無関係の純粋な幾何学的事実）。プリセットの |bx| ≤ ~1.05（既定軸角 90° の
+ * 場合。`bx` は B の作業座標 X）を覆うにはローカル半幅が必要だが、
+ * 軸角が斜交（例：アンビギュアス・シリンダーの 45°、`rotationY = −67.5°`、
+ * `|cos| ≈ 0.383`）になるとその前縮みで必要な物理半幅が約 2.6 倍に膨らむ
+ * （`1.05 / 0.383 ≈ 2.74` 倍）。カタログが使う 2 つの軸角（45°・90°）の
+ * どちらでも像が矩形の縁で欠けないよう、45° 側（前縮みが大きい方）を
+ * 基準に十分な余裕を持たせた値を選んである — 90° 側はこれで従来よりかなり
+ * 余裕が増える（幅広のテキスト・SVG や、45° よりさらに斜交軸に振った
+ * 自由入力ではなお欠けうる — 固定サイズの既知の簡略化）。
  */
-export const MIRROR_WIDTH = 3.6
+export const MIRROR_WIDTH = 6.2
 
 /** 反射面の高さ（作業座標）。B の y ∈ [−1, 1] を覆う（下記中心 y と対で決まる） */
 export const MIRROR_HEIGHT = 2.6
@@ -158,13 +209,23 @@ function mirrorRotationY(axisAngleDeg: number): number {
 }
 
 /**
- * ミラーの配置（位置・Y 軸回転）を axisAngleDeg・offset から導出する。
+ * ミラーの配置（位置・Y 軸回転）を axisAngleDeg・offset から導出する
+ * （レビュー Finding 1「反射像が鏡の外に落ちて何も映らない」の修正。
+ * ファイル冒頭「配置」の導出を参照）。
  *
- * 位置は「原点からの法線距離を常に offset/√2 に保つ」ことで求める —
- * 有限矩形の反射面のうち原点にもっとも近い点はこの法線距離と一致するため、
- * 立体との交差を軸角によらず避けられる（ファイル冒頭の解説を参照）。
+ * 平面上の点は「原点から平面への垂線の足」（`foot`。原点からの法線距離が
+ * 常に `offset/√2` になる点）を基準に、**矩形の幅方向（平面の接線）へ
+ * スライド**して選ぶ — スライド量は「中心の world X が、原点をこの平面で
+ * 鏡映した点の world X（`2·foot.x`）に一致する」ように解く
+ * （`tan(rotationY)` を使う閉形式。`rotationY` は直交 [15°,165°] の軸角
+ * 範囲で決して ±90° にならないため 0 除算はしない）。これにより、視点 A
+ * から見て「鏡に映るはずのもの」が矩形の中心付近に来る — スライドしない
+ * （＝ `foot` をそのまま中心にする）と、既定 90° 以外では反射像が矩形の
+ * 外側に落ちて鏡が黒いまま何も映さなくなる（Finding 1 の実体）。
+ *
  * 既定 90°・既定オフセットは従来の厳密値 `(MIRROR_OFFSET, MIRROR_CENTER_Y, 0)`
- * をそのまま返す。
+ * をそのまま返す — この式で 90° を解いても同じ値になる（ファイル冒頭を
+ * 参照）ため、意味の変わらない最適化（`atan2` 系の丸め誤差を混入させない）。
  */
 function mirrorTransform(
   axisAngleDeg: number,
@@ -178,9 +239,53 @@ function mirrorTransform(
     return { position: [MIRROR_OFFSET, MIRROR_CENTER_Y, 0], rotationY }
   }
   const distance = offset / Math.SQRT2
-  const x = -distance * Math.sin(rotationY)
-  const z = -distance * Math.cos(rotationY)
+  const sin = Math.sin(rotationY)
+  const cos = Math.cos(rotationY)
+  const footX = -distance * sin
+  const footZ = -distance * cos
+  // 幅方向スライド量。中心の world X を footX から 2*footX（原点の鏡像の
+  // world X）へ動かすのに必要な、幅方向単位ベクトル (cos, 0, -sin) 沿いの量
+  const slide = -distance * (sin / cos)
+  const x = footX + slide * cos
+  const z = footZ - slide * sin
   return { position: [x, MIRROR_CENTER_Y, z], rotationY }
+}
+
+/**
+ * ミラー平面の world-space バウンディング（X 半幅・Y 範囲）。**A スナップ
+ * （視点 A / front）の構図計算専用**（CameraRig.tsx `switchToOrthographic`。
+ * FR-102 拡張 / レビュー Finding 1「ミラーがビューポート右端で欠ける」の
+ * 修正点）。
+ *
+ * 視点 A のカメラは常に +Z に置かれ up=+Y なので、正射影の画面右 = world
+ * +X・画面上 = world +Y（CameraRig.tsx / SweetSpot.ts のカメラ規約）。
+ * したがって「鏡がスナップの画角に収まるか」は world X・Y の範囲だけで
+ * 決まり、Z（奥行き）は無関係 — このバウンディングもその 2 軸だけを返す。
+ *
+ * {@link mirrorTransform} を経由するので、実際にレンダーされる位置・回転
+ * （軸角 90° の厳密値分岐も含む）と常に一致する。ここで独自に位置を
+ * 再計算すると、ミラーの実配置とスナップの構図がずれる事故になる —
+ * 「ミラーとカメラの構図は独立に計算しない」という Finding 1 の指摘そのもの。
+ *
+ * 回転（Y 軸）は平面のローカル Y をそのまま world Y に写す（PlaneGeometry
+ * の Y 軸回転は Y 成分を変えない）ので、Y 方向の半幅は常に
+ * `MIRROR_HEIGHT/2`（回転に依存しない）。X 方向はローカル X が
+ * `cos(rotationY)` 倍されて world X に載るため、半幅は
+ * `(MIRROR_WIDTH/2) * |cos(rotationY)|`。
+ */
+export function mirrorFrameExtent(
+  axisAngleDeg: number = DEFAULT_AXIS_ANGLE_DEG,
+  offset: number = MIRROR_OFFSET,
+): { minX: number; maxX: number; minY: number; maxY: number } {
+  const { position, rotationY } = mirrorTransform(axisAngleDeg, offset)
+  const halfWidthX = (MIRROR_WIDTH / 2) * Math.abs(Math.cos(rotationY))
+  const halfHeightY = MIRROR_HEIGHT / 2
+  return {
+    minX: position[0] - halfWidthX,
+    maxX: position[0] + halfWidthX,
+    minY: position[1] - halfHeightY,
+    maxY: position[1] + halfHeightY,
+  }
 }
 
 /**

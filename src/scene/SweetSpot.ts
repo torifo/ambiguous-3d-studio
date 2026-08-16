@@ -298,6 +298,82 @@ export function perspectiveHalfHeightAt(fovDeg: number, distance: number): numbe
 }
 
 /**
+ * 立体側の視点 A シルエットの想定半高（作業座標）。正規化
+ * （geometry/normalize.ts）は常にシルエット高さを厳密に
+ * `WORKING_HEIGHT`（studio/useGenerationPipeline.ts、既定 2）へ合わせるため、
+ * 視点 A から直接見える形（= 入力シルエット A そのもの）の半高は常にこの値。
+ * SweetSpot.ts は three にも DOM にも依存しない不変条件（ファイル冒頭）を
+ * 保つため、`WORKING_HEIGHT` を import せずここに複製する — 値がずれたら
+ * `SweetSpot.test.ts` が `WORKING_HEIGHT` と突き合わせて検出する。
+ */
+export const APPROX_SOLID_HALF_HEIGHT = 1
+
+/**
+ * 立体側の視点 A シルエットの想定半幅（作業座標、保守的な見積り）。
+ *
+ * 実際の輪郭境界はジオメトリパイプライン（`geometryRef`。Viewport 経由）
+ * でしか手に入らず、CameraRig はその契約を持たない（Viewport.tsx はこの
+ * タスクの所有範囲外）。カタログのプリセット実測（`normalizeSilhouette`
+ * 適用後、`WORKING_HEIGHT` を高さ 2 として測定：正方形・円 = 1.0、
+ * ハート ≈ 1.107、スペード ≈ 0.84）を上回る値を安全側の定数として使う —
+ * 幅広のテキスト・SVG などこれを超えるシルエットでは、A スナップの余白が
+ * その分減る（scene/VirtualMirror.tsx の `MIRROR_WIDTH` の根拠と同種の
+ * 既知の簡略化）。
+ */
+export const APPROX_SOLID_HALF_WIDTH = 1.15
+
+/**
+ * A スナップの構図に足す余白（比率）。中身（立体・ミラー）が画角の縁に
+ * 張り付かないための係数。1 なら「ぴったり収まる」— それでは端に触れて
+ * 見えるため、12% だけ広く取る。
+ */
+export const FRAME_MARGIN = 1.12
+
+/**
+ * ミラーが有効なときの視点 A（front）スナップの zoom（FR-102 拡張 /
+ * レビュー Finding 1「ミラーが構図と独立に置かれ、ビューポート右端で
+ * 欠ける」の修正）。
+ *
+ * **ミラーは装飾ではなく錯視の成立機構そのもの**（scene/VirtualMirror.tsx
+ * 冒頭）なので、A の構図は「立体だけ」ではなく「立体とミラーの反射面の
+ * 両方」を画角に収めて初めて意味を持つ — 直接見える形と鏡に映る形が
+ * 同時に 1 画面にあることがこの錯視の要（design.md）。
+ *
+ * 視点 A のカメラは常に +Z・up=+Y なので、画面右 = world +X・画面上 =
+ * world +Y（ファイル冒頭のカメラ規約）。正射影フラスタムは常に原点
+ * （`controls.target`）を中心に対称なので、画角に収めるべき半幅・半高は
+ * 「立体の概算範囲」と「ミラーの実際の範囲」それぞれの絶対値の最大でよい。
+ *
+ * `matchZoom`（`orthoZoomToMatchPerspective` が返す、遷移直前の透視カメラと
+ * 見かけサイズを一致させる zoom）より**狭くなる方向には動かさない** —
+ * `Math.min` を取ることで、ミラーを含めた構図が要求する zoom（より広い
+ * = より小さい値）だけを追加で強制し、matchZoom が既にそれ以上に広い
+ * 場合（ユーザーが透視でズームアウトしていた場合）はそちらを尊重する。
+ *
+ * ミラー無効時は呼び出し側（CameraRig.tsx）がこの関数自体を呼ばない —
+ * 既存の `matchZoom` だけを使う従来の挙動から 1 ビットも変えないため。
+ */
+export function frontMirrorFramingZoom(
+  matchZoom: number,
+  aspect: number,
+  orthoHalfHeight: number,
+  mirrorBoundsX: readonly [number, number],
+  mirrorBoundsY: readonly [number, number],
+): number {
+  const neededHalfWidth =
+    Math.max(APPROX_SOLID_HALF_WIDTH, Math.abs(mirrorBoundsX[0]), Math.abs(mirrorBoundsX[1])) *
+    FRAME_MARGIN
+  const neededHalfHeight =
+    Math.max(APPROX_SOLID_HALF_HEIGHT, Math.abs(mirrorBoundsY[0]), Math.abs(mirrorBoundsY[1])) *
+    FRAME_MARGIN
+  const framingZoom = Math.min(
+    orthoHalfHeight / neededHalfHeight,
+    (orthoHalfHeight * aspect) / neededHalfWidth,
+  )
+  return Math.min(matchZoom, framingZoom)
+}
+
+/**
  * 透視 → 正射影の切替で**見かけサイズを保つ** zoom（FR-023 /
  * design.md「投影の切り替え」）。正射影カメラの可視半高は
  * `orthoHalfHeight / zoom` なので、透視の可視半高

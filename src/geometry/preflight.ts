@@ -101,9 +101,13 @@ import type { Contour, PreflightWarning } from './types'
 export const SCANLINE_COUNT = 256
 
 /**
- * THIN_NECK 閾値：共通 Y 範囲の高さに対する最小区間幅の比。
- * 既定 0.02 = 高さの 2%。実寸の既定 60mm（FR-029）では約 1.2mm に相当し、
- * FDM 印刷で折れやすくなる目安の壁厚に合わせている。
+ * THIN_NECK 閾値：共通 Y 範囲の高さに対する**真のくびれ幅**（後述
+ * {@link narrowestGenuineNeck}）の比。既定 0.02 = 高さの 2%。実寸の既定
+ * 60mm（FR-029）では約 1.2mm に相当し、FDM 印刷で折れやすくなる目安の
+ * 壁厚に合わせている。とがった先端（先には何もぶら下がっていない箇所）
+ * の幅はこの判定に一切数えない — レビュー Finding 2「とがった形状は
+ * 必ず先端で幅 0 に近づくため、この判定なしでは常に発火してしまう」の
+ * 修正。
  */
 export const THIN_NECK_RATIO = 0.02
 
@@ -367,6 +371,70 @@ function minIntervalWidth(intervals: ReadonlyArray<[number, number]>): number {
     if (to - from < min) min = to - from
   }
   return min
+}
+
+/**
+ * 走査順（Y 昇順）に並んだ live な高さごとの幅の列から、**真のくびれ**の
+ * 最小幅を返す（レビュー Finding 2「とがった先端を全部 THIN_NECK として
+ * 誤検出する」の修正）。
+ *
+ * ## ルール
+ *
+ * ある走査線 `i` を「真のくびれの候補」とみなすのは、**その走査線より
+ * 手前側にも奥側にも、`widths[i]` 以上に幅がある走査線が少なくとも 1 本
+ * ずつ存在する**ときだけ（走査範囲の両端から見て、途中で自分以上の幅に
+ * 戻る箇所があるということ）。候補の中で最小の幅を返す。候補が 1 つも
+ * なければ `Infinity`（くびれなし）。
+ *
+ * ## なぜこれで「先端」と「くびれ」を区別できるか
+ *
+ * スペードの上端・ハートの下端のような**先端**は、走査範囲の端に近づく
+ * につれて幅が単調にゼロへ収束する — 定義上、先端側には「自分以上の幅」
+ * を持つ走査線が 1 本も存在しない（そこから先には何もぶら下がっていない
+ * ことの直接の言い換え）。したがってこのルールでは先端付近の走査線は
+ * 一貫して候補から外れ、`THIN_NECK` は「とがった形状なら常に、無意味な
+ * 0.0mm で」発火しなくなる。
+ *
+ * 一方、**両端まで太さの変わらない一様に細い形状**（例：`preflight.test.ts`
+ * の「細すぎる首」フィクスチャ — 幅 0.1 の棒が範囲の端から端まで一定）は、
+ * 内部のどの走査線から見ても「自分と同じ幅」の走査線が両側に存在する
+ * （比較は `>=`、同値も「自分以上」に含める）ため、真のくびれとして
+ * 正しく残る — 太さが一様であること自体は折れやすさを変えないので、
+ * 除外する理由がない。**2 つの太い部分に挟まれた本物のくびれ**（バランス
+ * ダンベル形。`preflight.test.ts` の「レビュー Finding」テストで構築）も、
+ * 両側の太い部分がそのまま「自分以上の幅」の証人になるため同様に残る。
+ *
+ * `>=` の比較には浮動小数点誤差を吸収する {@link EPS} のスラックを持たせる
+ * （実際の走査線間の幅の変化は EPS よりはるかに大きいため、真の先細りを
+ * 誤って「一様」扱いすることはない）。
+ */
+function narrowestGenuineNeck(widths: readonly number[]): number {
+  const n = widths.length
+  if (n === 0) return Infinity
+
+  const prefixMax = new Array<number>(n)
+  let runningPrefix = -Infinity
+  for (let i = 0; i < n; i++) {
+    prefixMax[i] = runningPrefix
+    if (widths[i] > runningPrefix) runningPrefix = widths[i]
+  }
+
+  const suffixMax = new Array<number>(n)
+  let runningSuffix = -Infinity
+  for (let i = n - 1; i >= 0; i--) {
+    suffixMax[i] = runningSuffix
+    if (widths[i] > runningSuffix) runningSuffix = widths[i]
+  }
+
+  let neck = Infinity
+  for (let i = 0; i < n; i++) {
+    const hasWiderBefore = prefixMax[i] >= widths[i] - EPS
+    const hasWiderAfter = suffixMax[i] >= widths[i] - EPS
+    if (hasWiderBefore && hasWiderAfter && widths[i] < neck) {
+      neck = widths[i]
+    }
+  }
+  return neck
 }
 
 const fmt = (v: number): string => v.toFixed(2)
@@ -654,7 +722,7 @@ function sideLabel(side: ViewpointId): string {
  * | 全走査線でスライスが空 | `EMPTY_INTERSECTION`（生成しない） | exact |
  * | 一部の視点だけ被覆が空の帯 | `EMPTY_BAND`（視点ごとに 1 件） | exact |
  * | live な全走査線で島数の積が 2 以上 | `LIKELY_DISCONNECTED` | estimated |
- * | 最小区間幅が閾値未満 | `THIN_NECK` | estimated |
+ * | 真のくびれ幅（{@link narrowestGenuineNeck}）が閾値未満 | `THIN_NECK` | estimated |
  *
  * bbox の重なりは被覆の重なりの必要条件にすぎない（例：外輪郭と同一の穴を持つ
  * シルエットは bbox が正常でも被覆が常に空）。そのため走査後にも判定し、
@@ -812,7 +880,11 @@ export function runPreflight(
   /** 「他に被覆のある視点がある高さで空だった」視点 = 責任を負う視点 */
   const blamed: Partial<Record<ViewpointId, boolean>> = {}
   let minProduct = Infinity
-  let minWidth = Infinity
+  // live な走査線ごとの幅（Y 昇順）。THIN_NECK は走査後に
+  // {@link narrowestGenuineNeck} でこの列から「真のくびれ」だけを拾う
+  // （レビュー Finding 2。とがった先端を「幅 0 のくびれ」と誤検出しないため、
+  // ここでは生の最小値をその場では確定しない）
+  const liveWidths: number[] = []
   let firstLiveK = -1
   let lastLiveK = -1
 
@@ -864,7 +936,7 @@ export function runPreflight(
         const widthC = liveWidthFromC(scanC, intervalsA, intervalsB, shearCos, shearSin)
         if (widthC < widthAtY) widthAtY = widthC
       }
-      if (widthAtY < minWidth) minWidth = widthAtY
+      liveWidths.push(widthAtY)
     }
   }
   closeAllBands()
@@ -907,6 +979,7 @@ export function runPreflight(
     })
   }
 
+  const minWidth = narrowestGenuineNeck(liveWidths)
   if (minWidth < thinNeckRatio * (sharedHi - sharedLo)) {
     warnings.push({
       code: 'THIN_NECK',

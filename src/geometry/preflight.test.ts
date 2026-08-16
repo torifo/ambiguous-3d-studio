@@ -246,6 +246,63 @@ describe('geometry/preflight', () => {
     expect(report.ok).toBe(false)
     expect(report.emptyBands).toHaveLength(0)
   })
+
+  /**
+   * レビュー Finding 2（THIN_NECK の誤検出）の回帰テスト。
+   *
+   * 「とがった先端」と「本物のくびれ」を区別できることを、3 段階で検証する：
+   * (1) 合成フィクスチャで先端が誤検出されないこと、(2) 実プリセット
+   * （スペード × ハート）でバグ報告そのものが再現しないこと、
+   * (3) 本物のダンベル形では引き続き発火すること。
+   */
+  it('両端がとがった図形（先端で幅 0 に収束するだけ）では THIN_NECK を誤検出しない', () => {
+    // A: 上端 (y=10) がとがった二等辺三角形（頂点で幅 0 に収束）
+    const a: Contour[] = [{ isHole: false, points: new Float64Array([-1, 0, 1, 0, 0, 10]) }]
+    // B: 下端 (y=0) がとがった二等辺三角形（頂点で幅 0 に収束）
+    const b: Contour[] = [{ isHole: false, points: new Float64Array([0, 0, 1, 10, -1, 10]) }]
+    const report = runPreflight(a, b)
+
+    // 組み合わせ幅（min(A,B)）は y=0 で B の先端により、y=10 で A の先端により
+    // それぞれ 0 に収束する「両端がとがった」形状 — スペード×ハートと同じ構造。
+    // 先端はくびれではないので、警告なしで通る
+    expect(warningOf(report, 'THIN_NECK')).toBeUndefined()
+    expect(report.ok).toBe(true)
+  })
+
+  it('スペード×ハート（両端がとがった実プリセット）では THIN_NECK を誤検出しない（バグ報告の実地再現）', () => {
+    // トランプマークの変身立体（catalogue/illusions.ts の card-suits）そのもの。
+    // スペードは上端が、ハートは下端が、それぞれ 1 点に収束する — 旧実装は
+    // この組み合わせで常に「最も細い部分の幅は約 0.0mm」を報告していた
+    const spade = normalizeSilhouette(presetToContours('spade'), 2).contours
+    const heart = normalizeSilhouette(presetToContours('heart'), 2).contours
+    const report = runPreflight(spade, heart)
+
+    expect(warningOf(report, 'THIN_NECK')).toBeUndefined()
+  })
+
+  it('ダンベル形（2 つの太い部分に挟まれた本物のくびれ）では THIN_NECK が引き続き発火する', () => {
+    // A: 上下 y∈[0,4]・[6,10] が幅 4 の太い塊、中央 y∈[4,6] だけ幅 0.1 に
+    // くびれるダンベル形（構成は本ファイル内の「本物のくびれ」フィクスチャ
+    // と同じ手法 — 太い部分へいったん外へ出てから細い首を通り、また外へ戻る）
+    const waistHalfWidth = 0.05
+    const a: Contour[] = [
+      {
+        isHole: false,
+        points: new Float64Array([
+          -2, 0, 2, 0, 2, 4, waistHalfWidth, 4, waistHalfWidth, 6, 2, 6, 2, 10, -2, 10, -2, 6,
+          -waistHalfWidth, 6, -waistHalfWidth, 4, -2, 4,
+        ]),
+      },
+    ]
+    const b = [rect(-3, 0, 3, 10)] // B は全高で十分広く、くびれを作らない
+    const report = runPreflight(a, b)
+
+    const warning = warningOf(report, 'THIN_NECK')
+    expect(warning).toBeDefined()
+    expect(warning!.certainty).toBe('estimated')
+    expect(warning!.minWidth).toBeCloseTo(2 * waistHalfWidth, 9)
+    expect(report.ok).toBe(false)
+  })
 })
 
 /**

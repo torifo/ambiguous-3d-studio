@@ -73,6 +73,7 @@ import { useStudioStore } from '../store/useStudioStore'
 import {
   angleBetween,
   easeInOutCubic,
+  frontMirrorFramingZoom,
   matchedSweetSpot,
   orthoZoomToMatchPerspective,
   perspectiveDistanceToMatchOrtho,
@@ -89,6 +90,7 @@ import {
   type SweetSpotView,
   type Vec3Like,
 } from './SweetSpot'
+import { mirrorFrameExtent, selectVirtualMirrorEnabled } from './VirtualMirror'
 
 /** サイドバーのボタンと揃えた見た目（44px 以上のタップ領域 + 可視フォーカス） */
 const OVERLAY_BUTTON_CLASS =
@@ -251,6 +253,16 @@ export function CameraRig() {
    * 透視 → 正射影（スナップ完了時。FR-023）。切替の瞬間に画面上の見かけ
    * サイズが変わらないよう、現在距離から zoom を解く（design.md
    * 「投影の切り替え」）。位置・姿勢は透視カメラをそのまま引き継ぐ。
+   *
+   * **視点 A（front）でミラーが有効なときだけ**、この見かけサイズ一致の
+   * zoom をさらに広げる（レビュー Finding 1）。ミラーは装飾ではなく錯視の
+   * 成立機構そのものなので、A の構図は立体とミラーの反射面を両方画角に
+   * 収めて初めて意味を持つ — 直前の透視カメラがどれだけズームしていたかに
+   * 依存する見かけサイズ一致だけでは、ミラーがビューポート外に落ちうる
+   * （実際の不具合の症状）。`frontMirrorFramingZoom`（SweetSpot.ts）が
+   * 純関数として計算し、ここは軸角・オフセット・ミラーの実配置
+   * （`mirrorFrameExtent`。VirtualMirror.tsx）を橋渡しするだけ。
+   * side / top / iso とミラー無効時は 1 ビットも変えない。
    */
   const switchToOrthographic = useCallback(
     (view: SnapView): void => {
@@ -261,8 +273,22 @@ export function CameraRig() {
       const st = get()
 
       const distance = Math.max(persp.position.distanceTo(controls.target), 1e-3)
-      ortho.zoom = orthoZoomToMatchPerspective(ORTHO_HALF_HEIGHT, persp.fov, distance)
+      let zoom = orthoZoomToMatchPerspective(ORTHO_HALF_HEIGHT, persp.fov, distance)
       const aspect = st.size.width / Math.max(st.size.height, 1)
+
+      if (view === 'front' && selectVirtualMirrorEnabled(useStudioStore.getState())) {
+        const { input, options } = useStudioStore.getState()
+        const mirror = mirrorFrameExtent(input.axisAngleDeg, options.mirrorOffset)
+        zoom = frontMirrorFramingZoom(
+          zoom,
+          aspect,
+          ORTHO_HALF_HEIGHT,
+          [mirror.minX, mirror.maxX],
+          [mirror.minY, mirror.maxY],
+        )
+      }
+
+      ortho.zoom = zoom
       ortho.left = -ORTHO_HALF_HEIGHT * aspect
       ortho.right = ORTHO_HALF_HEIGHT * aspect
       ortho.top = ORTHO_HALF_HEIGHT
