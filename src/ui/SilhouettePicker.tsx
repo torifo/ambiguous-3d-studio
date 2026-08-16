@@ -71,7 +71,10 @@ const KIND_LABELS: Record<InputKind, string> = {
   svg: 'SVG',
 }
 
-/** FR-001 の 7 図形の表示名。id は sources/presets.ts の PRESET_IDS と対応 */
+/**
+ * プリセット図形の表示名。id は sources/presets.ts の PRESET_IDS と対応。
+ * FR-001 の 7 図形 + FR-100 のトランプ 4 マーク（♥ は 7 図形と共用）。
+ */
 const PRESET_LABELS: Record<PresetId, string> = {
   circle: '円',
   square: '正方形',
@@ -80,6 +83,9 @@ const PRESET_LABELS: Record<PresetId, string> = {
   star: '星',
   arrow: '矢印',
   cross: '十字',
+  spade: 'スペード',
+  diamond: 'ダイヤ',
+  club: 'クラブ',
 }
 
 const VIEWPOINT_LABELS = {
@@ -110,6 +116,21 @@ const ICON_SHAPES: Record<PresetId, ReactElement> = {
       points="10,3 14,3 14,10 21,10 21,14 14,14 14,21 10,21 10,14 3,14 3,10 10,10"
       fill="currentColor"
     />
+  ),
+  spade: (
+    <g fill="currentColor">
+      <path d="M12 2.4 C 12 2.4 3.8 8.8 3.8 13.6 C 3.8 16.2 5.8 17.9 8.1 17.9 C 9.9 17.9 11.4 16.8 12 15.2 C 12.6 16.8 14.1 17.9 15.9 17.9 C 18.2 17.9 20.2 16.2 20.2 13.6 C 20.2 8.8 12 2.4 12 2.4 Z" />
+      <path d="M12 13.5 C 12.6 18 13.4 20.2 15.4 21.8 L 8.6 21.8 C 10.6 20.2 11.4 18 12 13.5 Z" />
+    </g>
+  ),
+  diamond: <polygon points="12,2 18.6,12 12,22 5.4,12" fill="currentColor" />,
+  club: (
+    <g fill="currentColor">
+      <circle cx="12" cy="6.6" r="4" />
+      <circle cx="7.4" cy="14" r="4" />
+      <circle cx="16.6" cy="14" r="4" />
+      <path d="M12 12.5 C 12.7 17.5 13.4 20.2 15.4 21.8 L 8.6 21.8 C 10.6 20.2 11.3 17.5 12 12.5 Z" />
+    </g>
   ),
 }
 

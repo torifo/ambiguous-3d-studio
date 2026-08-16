@@ -1,8 +1,12 @@
 import type * as THREE from 'three'
 
 /**
- * プリセット図形の識別子（FR-001: 円 / 正方形 / 正三角形 / ハート / 星 / 矢印 / 十字）。
- * 実体（輪郭データ）は sources/presets.ts（Wave 2）が持つ。
+ * プリセット図形の識別子。
+ * - FR-001: 円 / 正方形 / 正三角形 / ハート / 星 / 矢印 / 十字
+ * - FR-100: トランプの 4 マーク（♠♥♦♣）。カタログの「トランプマークの変身立体」が
+ *   要求する。♥ は FR-001 で既にあるので、追加は ♠♦♣ の 3 つ
+ *
+ * 実体（輪郭データ）は sources/presets.ts が持つ。
  */
 export type PresetId =
   | 'circle'
@@ -12,6 +16,9 @@ export type PresetId =
   | 'star'
   | 'arrow'
   | 'cross'
+  | 'spade'
+  | 'diamond'
+  | 'club'
 
 /**
  * 単一の閉パス。Y 上向き、単位は正規化後の作業座標系。
