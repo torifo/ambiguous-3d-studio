@@ -138,6 +138,62 @@ describe('warningCopy / EMPTY_INTERSECTION', () => {
     expect(copy.body).not.toContain('シルエット B')
     expect(copy.body).not.toContain('視点 C')
   })
+
+  // Finding 3（アドバイザリレビュー）の回帰防止: emptySides に 'C' が含まれるのは
+  // 「A・B が両方とも被覆を持つ高さで、C だけがその位置を許さなかった」ケース
+  // （geometry/preflight.ts の blamed.C）。A/B と同じ「C に必要な被覆がなかった」
+  // という文型を使い回すと、EMPTY_BAND の C 分岐が明示的に否定しているのと同じ
+  // 誤ったモデル（C が「高さごとの被覆」を持つ）を書いてしまう。
+  it('emptySides が [\'C\'] のとき、「C に必要な被覆」という誤ったモデルを書かない', () => {
+    const warning: ViewpointPreflightWarning = {
+      code: 'EMPTY_INTERSECTION',
+      certainty: 'exact',
+      message: '',
+      emptySides: ['C'],
+    }
+    const copy = warningCopy(warning, ORTHOGONAL_CTX)
+    expect(copy.body).toContain('視点 C')
+    expect(copy.body).not.toContain('C に必要な被覆')
+    expect(copy.body).not.toContain('視点 Cに必要な被覆')
+  })
+
+  it('emptySides が [\'C\'] のとき、A・B には材料があるという事実を明示する', () => {
+    const warning: ViewpointPreflightWarning = {
+      code: 'EMPTY_INTERSECTION',
+      certainty: 'exact',
+      message: '',
+      emptySides: ['C'],
+    }
+    const copy = warningCopy(warning, ORTHOGONAL_CTX)
+    expect(copy.body).toContain('A・B')
+    expect(copy.body).toContain('材料がある')
+  })
+
+  it('emptySides が [\'C\'] のとき、C だけでなく A・B を変えても解決することを示す（C 限定の助言にしない）', () => {
+    const warning: ViewpointPreflightWarning = {
+      code: 'EMPTY_INTERSECTION',
+      certainty: 'exact',
+      message: '',
+      emptySides: ['C'],
+    }
+    const copy = warningCopy(warning, ORTHOGONAL_CTX)
+    expect(copy.body).toContain('シルエット A')
+    expect(copy.body).toContain('シルエット B')
+    expect(copy.body).toContain('視点 C')
+  })
+
+  it('emptySides が [\'A\', \'C\'] のような混在でも、A 自身の被覆欠落と C の位置制約を両方書く', () => {
+    const warning: ViewpointPreflightWarning = {
+      code: 'EMPTY_INTERSECTION',
+      certainty: 'exact',
+      message: '',
+      emptySides: ['A', 'C'],
+    }
+    const copy = warningCopy(warning, ORTHOGONAL_CTX)
+    expect(copy.body).toContain('シルエット A')
+    expect(copy.body).toContain('視点 C')
+    expect(copy.body).not.toContain('C に必要な被覆')
+  })
 })
 
 describe('warningCopy / THIN_NECK', () => {

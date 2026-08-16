@@ -24,6 +24,29 @@
  * ファイル冒頭）。`side: 'C'` の `EMPTY_BAND` は「C 自身に材料がない帯」では
  * なく「A・B 両方に材料はあるが、C がその位置を許さない帯」なので、A / B と
  * 同じ文型を使い回すと事実と異なる。ここが `warningCopy` の要点。
+ *
+ * 同じ理由で `EMPTY_INTERSECTION.emptySides` に `'C'` が含まれる場合も、
+ * A/B と同じ「C に必要な被覆がなかった」という文型を使わない（アドバイザリレビューの
+ * 指摘で修正 — 以前はここが EMPTY_BAND の C 分岐と矛盾する誤ったモデルのまま
+ * だった）。`geometry/preflight.ts` の `blamed.C` は「A・B が両方とも被覆を持つ
+ * 高さで、C だけがその位置を許さなかった」ときに立つビットなので、正しい文は
+ * 「A・B の被覆と C が許す位置が噛み合わない」であり、対処も C 限定ではなく
+ * A・B のどちらを変えても同様に効くと書く。
+ *
+ * ## 2 つの並行した文言ソースのうち、ここ（statusCopy.ts）が勝つ
+ *
+ * `ViewpointPreflightWarning` は `message: string` フィールドも持ち、
+ * `geometry/preflight.ts` 側で個別に文面を組み立てている（例: 視点 C の
+ * カバレッジ皆無ケースの説明文）。しかし `StatusBanner.tsx` は常に
+ * `warningCopy(warning, ctx)` の戻り値だけを描画し、`warning.message` を
+ * 一度も読まない — 到達しない文言が計算されているだけ。しかも
+ * `preflight.ts` 側の `EMPTY_BAND` メッセージは `side` によらず
+ * 「${sideLabel(side)}に被覆がないため」という共通テンプレートを使っており、
+ * `side: 'C'` に対しても「C 自身に被覆がない」と書いてしまう（この
+ * ファイルが side: 'C' 用に特別扱いしている事実と矛盾する）。したがって
+ * 「どちらが勝つべきか」に実装上の答えはこのファイル一択：UI に出るのは
+ * ここの文言だけであり、`preflight.ts` の `message` は使われるべきではない
+ * （削除するかどうかは preflight.ts の所有者の判断）。
  */
 import type { ViewpointId, ViewpointPreflightWarning } from '../geometry/preflight'
 import { WORKING_HEIGHT } from '../studio/useGenerationPipeline'
@@ -82,16 +105,45 @@ export function warningCopy(
 ): WarningCopy {
   switch (warning.code) {
     case 'EMPTY_INTERSECTION': {
-      const named = warning.emptySides.map((side) => VIEWPOINT_LABEL[side])
+      const emptySides = warning.emptySides
+      if (emptySides.length === 0) {
+        // 高さ範囲そのものが重ならない場合、どちらも「相手の高さにいない」だけで
+        // 特定の視点に責任を帰せない（geometry/preflight.ts の emptyIntersection）
+        return {
+          badge: '確定',
+          title: '交差しない組み合わせです',
+          body: '高さ範囲そのものが重ならないため、この組み合わせの交差は空です。特定の図形が原因とは言えません。図形の高さや大きさを見直すと立体が生成できます。',
+        }
+      }
+
+      const abSides = emptySides.filter((side): side is 'A' | 'B' => side !== 'C')
+      const abNamed = abSides.map((side) => VIEWPOINT_LABEL[side])
+      const blamesC = emptySides.includes('C')
+
+      if (!blamesC) {
+        // A・B のみ：これらは文字どおり「その視点自身に被覆がない高さがある」ので
+        // 従来どおり「必要な被覆がなかった」と書いてよい
+        return {
+          badge: '確定',
+          title: '交差しない組み合わせです',
+          body: `${abNamed.join('・')}に必要な被覆がなかったため、この組み合わせの交差は空です。${abNamed.join('・')}を変えると立体が生成できることがあります。`,
+        }
+      }
+
+      // C が責任視点に含まれる場合：preflight.ts の `blamed.C` は「A・B が
+      // 両方とも被覆を持つ高さで、C がその位置を許さなかった」ときに立つ
+      // （emptyC の判定は !emptyA && !emptyB の下でしか行わない）。つまり
+      // 「C 自身に必要な被覆がなかった」という A/B と同型の文は事実として誤り —
+      // C は高さごとの被覆という量を持たない固定領域である（EMPTY_BAND の C 分岐と
+      // 同じ理由）。ここでは「A・B の被覆と、C が許す位置が噛み合わない」という
+      // 正しい形で書き、対処も C だけでなく A・B のどちらを変えても同様に効くことを示す
+      // （「C を変えると」とだけ書くと、A・B を変える方が簡単な場合にも C だけを
+      // 勧める誤ったアドバイスになる）
+      const abClause = abNamed.length > 0 ? `${abNamed.join('・')}に材料がない高さもあり、` : ''
       return {
         badge: '確定',
         title: '交差しない組み合わせです',
-        body:
-          named.length > 0
-            ? `${named.join('・')}に必要な被覆がなかったため、この組み合わせの交差は空です。${named.join('・')}を変えると立体が生成できることがあります。`
-            : // 高さ範囲そのものが重ならない場合、どちらも「相手の高さにいない」だけで
-              // 特定の視点に責任を帰せない（geometry/preflight.ts の emptyIntersection）
-              '高さ範囲そのものが重ならないため、この組み合わせの交差は空です。特定の図形が原因とは言えません。図形の高さや大きさを見直すと立体が生成できます。',
+        body: `${abClause}シルエット A・B の両方に材料がある高さでも、視点 C がその位置を一度も許していないため、この組み合わせの交差は空です。視点 C は高さに依らず横から一様に削る固定の領域であり、C 自身に高さごとの被覆が欠けているわけではありません。視点 C・シルエット A・シルエット B のいずれを変えても立体が生成できることがあります。`,
       }
     }
     case 'EMPTY_BAND': {

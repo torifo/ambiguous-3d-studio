@@ -22,7 +22,12 @@
  * リージョンとして**常にマウントしておく**（後からリージョンごと現れた内容は
  * 支援技術に通知されないため、器を先に置き中身だけを差し替える）。
  */
-import { selectIsOrthogonalAxes, useStudioStore, type StudioStatus } from '../store/useStudioStore'
+import {
+  selectIsOrthogonalAxes,
+  selectViewpointCount,
+  useStudioStore,
+  type StudioStatus,
+} from '../store/useStudioStore'
 import type { CsgError } from '../worker/protocol'
 import { stlMmPerUnit } from '../studio/scale'
 import { WORKING_HEIGHT } from '../studio/useGenerationPipeline'
@@ -63,13 +68,27 @@ interface Copy {
  * 「交差しない組み合わせ」という性質の提示（US-001）なので、
  * 他のコードと違い失敗の語彙を使わない。
  * switch は網羅的（default なし）— コード追加時はここがコンパイルエラーになる。
+ *
+ * `EMPTY_RESULT` だけは視点数で文面を分ける（FR-101 / illusion-catalogue.md の訂正）。
+ * `CsgError` 自体は `{ code: 'EMPTY_RESULT' }` のみでどの視点が原因かの情報を
+ * 持たないため（プリフライトの `EMPTY_INTERSECTION.emptySides` はここではなく
+ * 下の警告一覧 `warningCopy()` 側が持つ — 責務は分けたまま、視点「数」だけをここで見る）：
+ * - 2 視点: 「2 つのシルエットが同じ高さで同時に材料を持つ」という従来の文言のまま
+ * - 3 視点: 「2 つ」「同じ高さで」のどちらも視点 C には当てはまらない。C は
+ *   高さに依らず横から一様に削る固定領域であり「その高さの被覆」を持たないため
+ *   （geometry/preflight.ts ファイル冒頭の訂正）、3 視点をひとまとめに「同じ高さで」と
+ *   書くと C については誤りになる。ここでは「A・B の被覆と C が許す位置が噛み合わない」
+ *   という正しいモデルで書く
  */
-function describeError(error: CsgError): Copy {
+function describeError(error: CsgError, viewpointCount: 2 | 3): Copy {
   switch (error.code) {
     case 'EMPTY_RESULT':
       return {
         title: 'この組み合わせは交差しません',
-        body: '2 つのシルエットが同じ高さで同時に材料を持つことがないため、交差立体は生じません。これは図形の組み合わせの性質です。どちらかの図形を変えると生成できます。',
+        body:
+          viewpointCount === 3
+            ? '3 つの視点が同時に材料を持つ位置の組み合わせがないため、交差立体は生じません。視点 C は高さに依らず横から一様に削る固定の領域なので、シルエット A・B の両方に材料がある高さでも、C がその位置を許さなければ交差は空になります。これは図形の組み合わせの性質です。視点 C・シルエット A・シルエット B のいずれかを変えると生成できることがあります。'
+            : '2 つのシルエットが同じ高さで同時に材料を持つことがないため、交差立体は生じません。これは図形の組み合わせの性質です。どちらかの図形を変えると生成できます。',
       }
     case 'NOT_MANIFOLD':
       return {
@@ -124,6 +143,7 @@ export function StatusBanner(props: StatusBannerProps) {
   const heightMm = useStudioStore((s) => s.options.heightMm)
   const axisAngleDeg = useStudioStore((s) => s.input.axisAngleDeg)
   const isOrthogonalAxes = useStudioStore(selectIsOrthogonalAxes)
+  const viewpointCount = useStudioStore(selectViewpointCount)
   const storeRetryInit = useStudioStore((s) => s.retryInit)
   const retry = props.onRetryInit ?? storeRetryInit
   const warningCtx = { heightMm, axisAngleDeg, isOrthogonalAxes }
@@ -131,7 +151,7 @@ export function StatusBanner(props: StatusBannerProps) {
 
   const errorCopy =
     (status === 'error' || status === 'init-failed') && lastError !== null
-      ? describeError(lastError)
+      ? describeError(lastError, viewpointCount)
       : null
 
   // EMPTY_RESULT は性質の提示なので中立の枠、それ以外の失敗は注意の枠。

@@ -22,6 +22,24 @@
  * 「何を見せているか」という UI 専用の状態だからで、`useStudioStore` の
  * 入力を汚染しない。
  *
+ * ## ステータス面は 3 モード共通（アドバイザリレビュー Finding 1 の是正）
+ *
+ * `<StatusBanner />`（生成中／生成完了・`EMPTY_RESULT` の説明・プリフライト
+ * 警告・パーツ数・`init-failed` と再試行ボタン）は元々 `Sidebar` の内部にしか
+ * なく、`Sidebar` は `mode === 'free'` のときしかマウントされない。既定モードは
+ * `catalogue` なので、100% のユーザーが最初に着地する画面には `role="status"` も
+ * `aria-live` も一切存在せず、FR-025 が要求する `init-failed` の再試行導線が
+ * 到達不能になっていた。
+ *
+ * ここでは `<AppHeader />` として `<StatusBanner />` を aside の先頭
+ * （`<ModeTabs />` の直後）へ**追加**する。ただし `mode === 'free'` のときは
+ * 描画しない — `Sidebar` は無編集で残す方針（このタスクの制約）なので
+ * `Sidebar` 自身の `<StatusBanner />` を消せない。両方を同時に出すと同じ
+ * `role="status"` / `aria-live="polite"` リージョンが 2 つ並び、支援技術が同じ
+ * 内容を二重に読み上げる。「今マウントされている方が唯一の状態面」という
+ * 不変条件を保つため、`AppHeader` 側は `free` のときだけ自分を消して
+ * `Sidebar` 側に譲る（ちょうどモードパネルが 1 つしかマウントしないのと同じ発想）。
+ *
  * ## ジオメトリ・カメラ・合致状態はモードを跨いで共有する
  *
  * - ジオメトリ … `geometryRef`（ADR-004。React state を経由しない）。
@@ -39,6 +57,7 @@ import type { KeyboardEvent } from 'react'
 import { Sidebar } from './ui/Sidebar'
 import { Gallery } from './ui/Gallery'
 import { PuzzlePanel } from './ui/PuzzlePanel'
+import { StatusBanner } from './ui/StatusBanner'
 import { Viewport } from './scene/Viewport'
 import { useViewerStore, type SnapView } from './scene/SweetSpot'
 import { useGenerationPipeline } from './studio/useGenerationPipeline'
@@ -79,9 +98,18 @@ function useSweetSpotProps() {
  * （Gallery の選択強調、Sidebar 一式、PuzzlePanel のタイマーと出題）を持ち、
  * 同時に 3 つとも生かしておく理由がない — 特にパズルは「シルエットピッカーを
  * 画面に出さない」ことが要件なので、そもそも `<Sidebar />` を裏で
- * マウントしたままにはできない。`role="tab"` の `aria-selected` /
- * `aria-controls` と `role="tabpanel"` の `aria-labelledby` の対応関係は
- * 維持するので、選択の伝達と読み上げの契約は保ったまま実装だけ簡素にしている。
+ * マウントしたままにはできない。
+ *
+ * `role="tabpanel"` は現在のモードの分しか存在せず、その `id` はモードが
+ * 変わるたびに変わる（`mode-panel-${mode}`）。そのため非活性タブの
+ * `aria-controls` が指す id は DOM のどこにも存在しない（ダングリング参照。
+ * アドバイザリレビュー Finding 4）。`SilhouettePicker.tsx` のように全パネルを
+ * `hidden` 属性つきで常時マウントする手もあるが、それには上記の「パズルで
+ * `Sidebar` を裏にも出せない」という制約と真っ向から対立する。したがって
+ * ここでは `aria-controls` を**活性タブにだけ**付け、非活性タブでは省略する
+ * — 存在しない id を参照しないという最小の修正。`aria-selected` /
+ * `role="tabpanel"` の `aria-labelledby` の対応関係は変えていないので、
+ * 選択の伝達と読み上げの契約は保ったまま。
  */
 function ModeTabs(props: { mode: StudioMode; onSelect: (mode: StudioMode) => void }) {
   const { mode, onSelect } = props
@@ -115,7 +143,10 @@ function ModeTabs(props: { mode: StudioMode; onSelect: (mode: StudioMode) => voi
           role="tab"
           id={`mode-tab-${m}`}
           aria-selected={mode === m}
-          aria-controls={`mode-panel-${m}`}
+          // 非活性タブでは付けない（上記コメント参照。mode-panel-${m} は
+          // 活性モードのものしか DOM に存在しないため、常に付けると
+          // 2 タブぶんダングリング参照になる）
+          aria-controls={mode === m ? `mode-panel-${m}` : undefined}
           tabIndex={mode === m ? 0 : -1}
           onClick={() => onSelect(m)}
           onKeyDown={(event) => handleKeyDown(event, index)}
@@ -124,6 +155,36 @@ function ModeTabs(props: { mode: StudioMode; onSelect: (mode: StudioMode) => voi
           {MODE_LABELS[m]}
         </button>
       ))}
+    </div>
+  )
+}
+
+/**
+ * 3 モード共通のステータス面（アドバイザリレビュー Finding 1 / Finding 4）。
+ *
+ * 持たせるのは 2 つだけ：
+ * - 製品名の `<h1>`。従来は `Sidebar` の内部にしかなく、`free` 以外のモード
+ *   （既定の `catalogue` を含む）では画面のどこにも製品名が出ていなかった
+ * - `<StatusBanner />`。生成中／生成完了・`EMPTY_RESULT` の説明・プリフライト
+ *   警告・パーツ数・`init-failed` の再試行ボタンをまとめて持つ、唯一の
+ *   `role="status"` / `aria-live` リージョン一式
+ *
+ * `mode === 'free'` のときは何も描画しない。`Sidebar`（無編集で残す方針）が
+ * 同じ内容（同じ `<h1>Ambiguous 3D Studio</h1>` と同じ `<StatusBanner />`）を
+ * 自前で持っているため、ここでも描画すると見出しが 2 つ・生成ステータスの
+ * live リージョンが 2 つ同時に存在し、支援技術が同じ内容を二重に読み上げる。
+ * 「今どのモードでも状態面はちょうど 1 つ」という不変条件は、モードパネルが
+ * 常に 1 つしかマウントされないのと同じ考え方で保っている。
+ */
+function AppHeader(props: { mode: StudioMode; onRetryInit: () => void }) {
+  const { mode, onRetryInit } = props
+  if (mode === 'free') return null
+  return (
+    <div className="shrink-0 border-b border-neutral-800 pt-3 pb-3 pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]">
+      <h1 className="text-sm font-semibold tracking-wide text-neutral-100">Ambiguous 3D Studio</h1>
+      <div className="mt-2">
+        <StatusBanner onRetryInit={onRetryInit} />
+      </div>
     </div>
   )
 }
@@ -173,6 +234,7 @@ function App() {
           この flex 構成で初めて元どおりのサイズ計算が成立する。
         */}
         <ModeTabs mode={mode} onSelect={handleModeSelect} />
+        <AppHeader mode={mode} onRetryInit={retry} />
         <div
           role="tabpanel"
           id={`mode-panel-${mode}`}
