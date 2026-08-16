@@ -1,105 +1,69 @@
 /**
- * アプリシェル（Task 4.1）。生成パイプラインをここで**ちょうど 1 回**起動し、
- * サイドバー枠とビューポート枠を配置する。
+ * アプリシェル（Task 4.1 / Wave 5 配線）。生成パイプラインをここで**ちょうど 1 回**
+ * 起動し、サイドバー（src/ui）とビューポート（src/scene）を接続する。
  *
- * Wave 5 への継ぎ目：
- * - サイドバー枠（`<aside>`）→ Task 5.2 の `<Sidebar />` がここに入る
- * - ビューポート枠（`SidebarSlot` / `ViewportSlot` の中身）→ Task 5.1 の
- *   `<Viewport geometryRef={geometryRef} />` が `ViewportSlot` を置き換える。
- *   ジオメトリは React state ではなく `geometryRef`（ADR-004）で渡す —
- *   参照が最新になったことは store の `status: 'success'` 購読で知る
- * - `retry` は FR-025 の再試行。Wave 5 のサイドバーはこれをボタンに配線する
+ * このファイルが 2 つの Wave 5 エージェントの接合点であり、どちらにも
+ * 所有させていない（同一ファイルの奪い合いを避けるため — tasks.md の所有権の原則）。
+ * ここで繋ぐのは 3 本だけ：
+ *
+ * - ジオメトリ … `geometryRef`（ADR-004。React state を経由しない）
+ * - カメラ操作 … `useViewerStore.requestSnap`（UI → scene）
+ * - 合致状態 … `useViewerStore.matched`（scene → UI）
  */
-import { useStudioStore, type StudioStatus } from './store/useStudioStore'
-import {
-  useGenerationPipeline,
-  type GeometryRef,
-} from './studio/useGenerationPipeline'
+import { useCallback } from 'react'
+
+import { Sidebar } from './ui/Sidebar'
+import { Viewport } from './scene/Viewport'
+import { useViewerStore, sweetSpotLiveAngles, type SnapView } from './scene/SweetSpot'
+import { useGenerationPipeline } from './studio/useGenerationPipeline'
 
 /**
- * FR-025: 状態 → 表示文言。`loading-wasm` は**正常系**であり、
- * エラーとして提示しない（「準備中」を出す）。
+ * 合致状態を SweetSpotIndicator の props に変換する。
+ *
+ * `matched` は**離散イベント**（合致した / 外れた）なので購読してよい。
+ * 一方 `sweetSpotLiveAngles` は毎フレーム更新されるため、React state に
+ * 載せると 60fps ぶんの再レンダリングが発生し NFR-002 を壊す。ここでは
+ * 合致が変化した時点の値をサンプリングするに留める。
+ *
+ * 連続的な角度表示（FR-021 の「リアルタイムに表示」）は、React を経由せず
+ * DOM を直接更新する必要がある。scene 側が `sweetSpotLiveAngles` を
+ * 非リアクティブに公開しているのはそのためで、配線はまだ入れていない。
  */
-const STATUS_LABELS: Record<StudioStatus, string> = {
-  'loading-wasm': '準備中…',
-  ready: '準備完了',
-  generating: '生成中…',
-  success: '生成完了',
-  error: '生成に失敗しました',
-  'init-failed': 'エンジンの初期化に失敗しました',
+function useSweetSpotProps() {
+  const matched = useViewerStore((s) => s.matched)
+  const angleRad = matched === 'A' ? sweetSpotLiveAngles.a : sweetSpotLiveAngles.b
+  return {
+    target: matched,
+    angleDiffDeg: matched === null ? null : (angleRad * 180) / Math.PI,
+    matched: matched !== null,
+  }
 }
 
-/**
- * サイドバー枠のプレースホルダ。Wave 5（Task 5.2）が `<Sidebar />` に
- * 差し替える。ここでは FR-025 の最小限（状態表示・init-failed の再試行）
- * だけを提示する。
- */
-function SidebarSlot(props: { retry: () => void }) {
-  const status = useStudioStore((s) => s.status)
-  return (
-    <div className="flex h-full flex-col gap-3 p-4">
-      <h1 className="text-sm font-semibold tracking-wide">Ambiguous 3D Studio</h1>
-      <p aria-live="polite" className="text-xs text-neutral-400">
-        {STATUS_LABELS[status]}
-      </p>
-      {status === 'init-failed' && (
-        <button
-          type="button"
-          onClick={props.retry}
-          className="w-fit rounded border border-neutral-600 px-3 py-1 text-xs hover:bg-neutral-800"
-        >
-          再試行
-        </button>
-      )}
-      <p className="mt-auto text-[10px] text-neutral-600">
-        入力 UI は Wave 5（Task 5.2）がここに入る
-      </p>
-    </div>
-  )
-}
-
-/**
- * ビューポート枠のプレースホルダ。Wave 5（Task 5.1）が
- * `<Viewport geometryRef={…} />` に差し替える。ref は描画トリガに
- * ならない（ADR-004）ため、ここでは参照が配線されていることだけを示す。
- */
-function ViewportSlot(props: { geometryRef: GeometryRef }) {
-  // ref の代入は再レンダリングを起こさない（ADR-004: カメラ操作で React を
-  // 動かさないための設計）。したがって「いつ ref を読み直すか」は status の
-  // 購読で決める。これを省くと、生成が成功しても初回の null を読んだまま
-  // 画面が更新されない — Task 5.1 の Viewport も同じ配線が必要。
-  const status = useStudioStore((s) => s.status)
-  const geometry = status === 'success' ? props.geometryRef.current : null
-  return (
-    <div className="flex h-full items-center justify-center">
-      <p className="text-xs text-neutral-600">
-        3D ビューポート（Wave 5 Task 5.1）— geometry:{' '}
-        {geometry
-          ? `あり（頂点 ${geometry.getAttribute('position').count} / 三角形 ${
-              (geometry.getIndex()?.count ?? 0) / 3
-            }）`
-          : 'なし'}
-      </p>
-    </div>
-  )
-}
-
-/**
- * アプリ本体。`useGenerationPipeline` はここで 1 回だけ呼ぶ
- * （design.md ディレクトリ表 / Task 4.1）。
- */
 function App() {
   const { geometryRef, retry } = useGenerationPipeline()
+  const requestSnap = useViewerStore((s) => s.requestSnap)
+  const sweetSpot = useSweetSpotProps()
+
+  const handleSnapView = useCallback((view: SnapView) => requestSnap(view), [requestSnap])
+  // FR-006 の「視点をリセット」は俯瞰へのスナップと同じ操作
+  const handleResetView = useCallback(() => requestSnap('iso'), [requestSnap])
+
   return (
     <div className="flex h-screen bg-neutral-950 text-neutral-100">
       <aside
         aria-label="コントロールサイドバー"
-        className="w-72 shrink-0 border-r border-neutral-800"
+        className="w-80 shrink-0 border-r border-neutral-800"
       >
-        <SidebarSlot retry={retry} />
+        <Sidebar
+          onRetryInit={retry}
+          onResetView={handleResetView}
+          onSnapView={handleSnapView}
+          geometryRef={geometryRef}
+          sweetSpot={sweetSpot}
+        />
       </aside>
       <main aria-label="3D ビューポート" className="min-w-0 flex-1">
-        <ViewportSlot geometryRef={geometryRef} />
+        <Viewport geometryRef={geometryRef} />
       </main>
     </div>
   )
