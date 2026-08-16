@@ -363,7 +363,15 @@ export function createGenerationPipeline(
     store.getState().inputAccepted(epoch)
 
     stage('preflight')
-    const report = runPreflight(contoursA, contoursB, { c: contoursC })
+    // axisAngleDeg を渡さないと、C を併用した斜交入力（FR-102）でプリフライトが
+    // 常に直交（90°）相当として判定してしまい、実際には非空な組み合わせを
+    // EMPTY_INTERSECTION として誤って拒否しうる（レビュー Finding 1）。
+    // 2 視点（c === null）ではこの値を runPreflight が一切参照しないため、
+    // 既存の 2 視点経路には影響しない
+    const report = runPreflight(contoursA, contoursB, {
+      c: contoursC,
+      axisAngleDeg: input.axisAngleDeg,
+    })
     store.getState().setWarnings(epoch, report.warnings, report.liveYRange)
 
     // 生成のゲートは EMPTY_INTERSECTION の有無**のみ**（トラップ 1）。

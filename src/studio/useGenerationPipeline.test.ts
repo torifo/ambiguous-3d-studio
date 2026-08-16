@@ -684,6 +684,70 @@ describe('斜交軸（FR-102）', () => {
   }, 30_000)
 })
 
+describe('視点 C × 斜交軸の併用（レビュー Finding 1 の回帰）', () => {
+  // レビューの失敗入力：A = 全面正方形（プリセット square がそのまま）、
+  // B = 細い縦帯、C = 対角の 2 つの塊。90° では真に空だが、120° では非空な
+  // 実体になる（geometry/preflight.test.ts の同じ入力での実 Wasm 検証を参照）。
+  // ここで確かめたいのはプリフライトの数理そのものではなく、
+  // **パイプラインが store の軸角を実際に runPreflight へ渡しているか**
+  // （渡し忘れると常に 90° 相当で判定され、120° でも誤って EMPTY_RESULT に
+  // 終端し Worker に一度もディスパッチされない）
+  const thinStrip = (): Contour[] => [
+    { points: new Float64Array([-0.05, -1, 0.05, -1, 0.05, 1, -0.05, 1]), isHole: false },
+  ]
+  const twoBlobs = (): Contour[] => [
+    { points: new Float64Array([0.6, 0.6, 1, 0.6, 1, 1, 0.6, 1]), isHole: false },
+    { points: new Float64Array([-1, -1, -0.6, -1, -0.6, -0.6, -1, -0.6]), isHole: false },
+  ]
+  const stripSource: SilhouetteSource = { kind: 'text', value: 'strip', fontId: 'builtin' }
+  const blobsSource: SilhouetteSource = { kind: 'text', value: 'blobs', fontId: 'builtin' }
+
+  it('90° は EMPTY_RESULT で終端し、120° に変えると実際に Worker へディスパッチされる', async () => {
+    const h = makeHarness()
+    await boot(h)
+
+    vi.mocked(textToContours)
+      .mockImplementationOnce(() => Promise.resolve(thinStrip()))
+      .mockImplementationOnce(() => Promise.resolve(twoBlobs()))
+
+    h.store.getState().applyInput({
+      a: { kind: 'preset', id: 'square' },
+      b: stripSource,
+      c: blobsSource,
+      axisAngleDeg: 90,
+    })
+    await settle()
+
+    // 90° はこの入力では実際にも空なので、対照として先に確認する
+    // （boot() 分の 1 件から増えていない = ディスパッチされていない）
+    expect(h.workers[0].requests).toHaveLength(1)
+    let s = h.store.getState()
+    expect(s.status).toBe('error')
+    expect(s.lastError).toEqual({ code: 'EMPTY_RESULT' })
+    expect(s.warnings.some((w) => w.code === 'EMPTY_INTERSECTION')).toBe(true)
+
+    // 同じ B・C のまま軸角だけ 120° にする。実体は非空になる
+    // （geometry/preflight.test.ts で実 Wasm 検証済み）。axisAngleDeg を
+    // runPreflight に渡していない実装なら、ここでも常に 90° 相当のまま
+    // 誤って EMPTY_RESULT に終端し、Worker には一度も届かない
+    vi.mocked(textToContours)
+      .mockImplementationOnce(() => Promise.resolve(thinStrip()))
+      .mockImplementationOnce(() => Promise.resolve(twoBlobs()))
+    h.store.getState().setAxisAngleDeg(120)
+    await settle()
+
+    expect(h.workers[0].requests).toHaveLength(2)
+    const req = h.workers[0].requests[1]
+    expect(req.axisAngleDeg).toBe(120)
+    expect(req.c).not.toBeNull()
+
+    h.workers[0].emitResponse(okResponse(req.generation))
+    s = h.store.getState()
+    expect(s.status).toBe('success')
+    expect(s.warnings.some((w) => w.code === 'EMPTY_INTERSECTION')).toBe(false)
+  })
+})
+
 describe('カメラ規約の公開（Wave 5 への契約）', () => {
   it('A / B / C の視点方向と up。C の up は −Z（+Z にすると C だけ鏡像になる）', () => {
     expect(viewpointCamera('A')).toEqual({ direction: [0, 0, 1], up: [0, 1, 0] })

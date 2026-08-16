@@ -1,9 +1,19 @@
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
+import createManifold from 'manifold-3d'
+import type { ManifoldToplevel } from 'manifold-3d'
+import { boundsOf, normalizeSilhouette } from './normalize'
+import { presetToContours } from '../sources/presets'
+import { computeDepths } from '../worker/protocol'
+import type { CsgRequest, SerializedContour } from '../worker/protocol'
+import { performCsg } from '../worker/csg.worker'
 import type { Contour } from './types'
-import { SCANLINE_COUNT, coveredIntervalsAt, runPreflight } from './preflight'
+import { SCANLINE_COUNT, containsPoint, coveredIntervalsAt, runPreflight } from './preflight'
 
-// フィクスチャはすべてインラインで構築する（presets / normalize は並行実装中のため
-// import しない）。巻き方向は正規化後の契約どおり：外輪郭 CCW / 穴 CW。
+// フィクスチャの大半はインラインで構築する。巻き方向は正規化後の契約どおり：
+// 外輪郭 CCW / 穴 CW。レビュー Finding 1〜3 の回帰テスト（このファイル末尾）だけは、
+// 実プリセット・実 Wasm CSG（`../worker/csg.worker`）と突き合わせるために
+// presets / normalize / manifold-3d を使う — `src/worker/csg.integration.test.ts` と
+// 同じ手法（Node 上で実物の manifold-3d を初期化し、performCsg を直接呼ぶ）。
 
 /** CCW の矩形輪郭。 */
 function rect(x0: number, y0: number, x1: number, y1: number): Contour {
@@ -368,5 +378,300 @@ describe('geometry/preflight — 視点 C（FR-101）', () => {
     expect(withC.estimatedComponents).toBe(2)
     // それでも c を渡さない呼び出しは元のまま
     expect(runPreflight(a, b)).toEqual(bare)
+  })
+})
+
+describe('geometry/preflight — containsPoint は coveredIntervalsAt と同じ被覆規約を持つ', () => {
+  it('区間の内側・外側で一致する（穴のあるドーナツで検証）', () => {
+    const donut = [rect(-4, -4, 4, 4), rect(-2, -2, 2, 2)]
+    // rect は CCW を返すので、穴側は明示的に CW へ反転する（正規化済み輪郭の契約）
+    const hole = { points: donut[1].points.slice().reverse(), isHole: true }
+    const shape = [donut[0], hole]
+
+    for (const y of [-3, 0, 1.5, 3.9]) {
+      const intervals = coveredIntervalsAt(shape, y)
+      for (const x of [-4.5, -3, -1.9, 0, 1.9, 3, 4.5]) {
+        const inInterval = intervals.some(([from, to]) => x > from && x < to)
+        expect(containsPoint(shape, x, y)).toBe(inInterval)
+      }
+    }
+  })
+})
+
+/**
+ * レビュー Finding 1〜3 の回帰テスト。
+ *
+ * 実プリセット・実 Wasm（manifold-3d）を Node 上で使う点が、このファイルの他の
+ * テストと違う（`src/worker/csg.integration.test.ts` と同じ手法）。3 つの発見は
+ * いずれも「走査線サンプリングでは掴めない細さ・角度」で初めて表に出るため、
+ * 既存の C 系テストが使ってきた広い軸平行矩形では再現できない
+ * （このファイル冒頭の合成フィクスチャ群では踏めない領域）。
+ */
+describe('geometry/preflight — レビュー Finding 1〜3 の回帰', () => {
+  let wasm: ManifoldToplevel
+  beforeAll(async () => {
+    wasm = await createManifold()
+    wasm.setup()
+  }, 30_000)
+
+  function extentOf(contours: Contour[]): { width: number; height: number } {
+    const b = boundsOf(contours)
+    return { width: b.maxX - b.minX, height: b.maxY - b.minY }
+  }
+
+  /** `performCsg` に渡すリクエストを、パイプラインと同じ深さ規則で組み立てる */
+  function buildRequest(parts: {
+    a: Contour[]
+    b: Contour[]
+    c?: Contour[] | null
+    axisAngleDeg?: number
+  }): CsgRequest {
+    const c = parts.c ?? null
+    const depths = computeDepths({
+      a: extentOf(parts.a),
+      b: extentOf(parts.b),
+      c: c === null ? null : extentOf(c),
+      axisAngleDeg: parts.axisAngleDeg,
+    })
+    return {
+      generation: 1,
+      a: { contours: parts.a as SerializedContour[], depth: depths.a },
+      b: { contours: parts.b as SerializedContour[], depth: depths.b },
+      c:
+        c === null || depths.c === null
+          ? null
+          : { contours: c as SerializedContour[], depth: depths.c },
+      axisAngleDeg: parts.axisAngleDeg,
+      baseplate: null,
+    }
+  }
+
+  describe('Finding 1（BLOCKER）: C 併用時の斜交軸', () => {
+    // レビューの失敗入力そのもの。A = 全面正方形、B = 細い縦帯、
+    // C = 対角の 2 つの塊。90° では真に空だが、120° / 135° / 150° では
+    // 非空な実体になる（レビュー記載の体積 0.00426 / 0.20627 / 0.00426 と一致）
+    const rawA = (): Contour[] => [rect(-1, -1, 1, 1)]
+    const rawB = (): Contour[] => [rect(-0.05, -1, 0.05, 1)]
+    const rawC = (): Contour[] => [rect(0.6, 0.6, 1, 1), rect(-1, -1, -0.6, -0.6)]
+
+    const a = (): Contour[] => normalizeSilhouette(rawA(), 2).contours
+    const b = (): Contour[] => normalizeSilhouette(rawB(), 2).contours
+    const c = (): Contour[] => normalizeSilhouette(rawC(), 2).contours
+
+    it('90° は preflight と実 CSG の両方で真に空になる（誤検出ではない対照）', () => {
+      const report = runPreflight(a(), b(), { c: c(), axisAngleDeg: 90 })
+      expect(warningOf(report, 'EMPTY_INTERSECTION')).toBeDefined()
+
+      const response = performCsg(wasm, buildRequest({ a: a(), b: b(), c: c(), axisAngleDeg: 90 }))
+      expect(response.ok).toBe(false)
+      if (response.ok) return
+      expect(response.error.code).toBe('EMPTY_RESULT')
+    })
+
+    it.each([
+      { angle: 120, volume: 0.00426 },
+      { angle: 135, volume: 0.20627 },
+      { angle: 150, volume: 0.00426 },
+    ])(
+      '$angle° は非空な実体になり、preflight はそれを EMPTY_INTERSECTION として拒否しない',
+      ({ angle, volume }) => {
+        // axisAngleDeg を無視して常に 90° 相当で判定する実装（修正前のバグ）なら、
+        // ここでも EMPTY_INTERSECTION を断定してしまう — 90° だけが真に空なので
+        const report = runPreflight(a(), b(), { c: c(), axisAngleDeg: angle })
+        expect(warningOf(report, 'EMPTY_INTERSECTION')).toBeUndefined()
+        expect(report.liveYRange).not.toBeNull()
+
+        // 実 Wasm の結果と突き合わせる：preflight が「非空」と言うなら、
+        // performCsg も非空な体積を返さなければならない
+        const response = performCsg(
+          wasm,
+          buildRequest({ a: a(), b: b(), c: c(), axisAngleDeg: angle }),
+        )
+        expect(response.ok).toBe(true)
+        if (!response.ok) return
+        expect(response.volume).toBeGreaterThan(0)
+        expect(response.volume).toBeCloseTo(volume, 4)
+      },
+    )
+
+    it('axisAngleDeg を渡さない呼び出しは 90°（既定）として評価される', () => {
+      const withDefault = runPreflight(a(), b(), { c: c() })
+      const withExplicit90 = runPreflight(a(), b(), { c: c(), axisAngleDeg: 90 })
+      expect(withDefault).toEqual(withExplicit90)
+      expect(warningOf(withDefault, 'EMPTY_INTERSECTION')).toBeDefined()
+    })
+  })
+
+  describe('Finding 2（MAJOR）: 視点 C の空判定はサンプリングではなく厳密でなければならない', () => {
+    it('円 × 正三角形 × 円は、三角形の頂点付近を偽の EMPTY_BAND(C) にしない', () => {
+      const a = normalizeSilhouette(presetToContours('circle'), 2).contours
+      const b = normalizeSilhouette(presetToContours('triangle'), 2).contours
+      const c = normalizeSilhouette(presetToContours('circle'), 2).contours
+
+      const report = runPreflight(a, b, { c })
+
+      // 修正前はここに y≈0.9961 で side:'C' の EMPTY_BAND が exact として立っていた
+      // （B_y の走査線ごとの被覆幅が 256 分割の C の w サンプル間隔より狭く、
+      // どのサンプルも命中しなかったため）。修正後は 1 本も出ない
+      const cBands = report.warnings.filter((w) => w.code === 'EMPTY_BAND' && w.side === 'C')
+      expect(cBands).toEqual([])
+
+      // liveYRange が正しく bbox の端近くまで届く（誤った帯で切り詰められない）
+      expect(report.liveYRange).not.toBeNull()
+      const step = (report.sharedYRange![1] - report.sharedYRange![0]) / SCANLINE_COUNT
+      expect(report.liveYRange![1]).toBeGreaterThan(1 - step)
+
+      // 実 CSG と突き合わせる：EMPTY_BAND は生成をゲートしないので実 CSG は
+      // もともと成功していたが、その解が liveYRange の上端付近まで実際に届いている
+      // ことを確かめる（「誤って途切れると主張した高さに実際は材料がある」の直接証拠）
+      const response = performCsg(wasm, buildRequest({ a, b, c }))
+      expect(response.ok).toBe(true)
+      if (!response.ok) return
+      let maxY = -Infinity
+      for (let i = 1; i < response.positions.length; i += 3) {
+        if (response.positions[i] > maxY) maxY = response.positions[i]
+      }
+      expect(maxY).toBeGreaterThan(0.99)
+    })
+
+    it('厳密性の直接証明：256 分割の走査線幅より狭い B の帯でも、全面 C（何も削らない）を偽の空と判定しない', () => {
+      // レビュー本文の「幅が分割幅より狭い B の帯」を、C 側を最も甘い条件
+      // （全面正方形 = 何も削らない）にして最小構成で再現する。
+      // A は常に全面被覆、B は高さ 10 の中央 1 点（y0）だけ幅 2e-7 まで
+      // くびれる砂時計形、C は A・B の bbox を覆う全面正方形。
+      // y0 は 256 本の走査線サンプルの中点そのものに一致させてあるので、
+      // 「サンプルが 1 点も命中しない」ことを偶然ではなく確実にする
+      const y0 = 128.5 * (10 / SCANLINE_COUNT)
+      const waistHalfWidth = 1e-7
+      const waistHalfHeight = 0.02
+
+      const a: Contour[] = [rect(-2, 0, 2, 10)]
+      const b: Contour[] = [
+        {
+          isHole: false,
+          points: new Float64Array([
+            -2, 0,
+            2, 0,
+            2, y0 - waistHalfHeight,
+            waistHalfWidth, y0 - waistHalfHeight,
+            waistHalfWidth, y0 + waistHalfHeight,
+            2, y0 + waistHalfHeight,
+            2, 10,
+            -2, 10,
+            -2, y0 + waistHalfHeight,
+            -waistHalfWidth, y0 + waistHalfHeight,
+            -waistHalfWidth, y0 - waistHalfHeight,
+            -2, y0 - waistHalfHeight,
+          ]),
+        },
+      ]
+      const c: Contour[] = [rect(-2, -2, 2, 2)]
+
+      const report = runPreflight(a, b, { c })
+
+      // 全面正方形の C は「何も削らない」— A・B が噛み合っていれば、
+      // どの高さでも空になりようがない。EMPTY_BAND(C) は 1 本も出てはならない
+      expect(report.warnings.filter((w) => w.code === 'EMPTY_BAND' && w.side === 'C')).toEqual([])
+      // くびれ自体は本物なので THIN_NECK（推定）は出てよいが、
+      // それは exact な EMPTY_BAND とは別物
+      expect(report.ok).toBe(false)
+      expect(warningOf(report, 'THIN_NECK')).toBeDefined()
+    })
+  })
+
+  describe('Finding 3（MODERATE）: THIN_NECK の C 寄与は live な高さだけを見る', () => {
+    it('三方向変身立体（円 × 正方形 × 三角形）は、2 視点なら THIN_NECK を出さない', () => {
+      const a = normalizeSilhouette(presetToContours('circle'), 2).contours
+      const b = normalizeSilhouette(presetToContours('square'), 2).contours
+      const c = normalizeSilhouette(presetToContours('triangle'), 2).contours
+
+      const twoViewpoints = runPreflight(a, b)
+      expect(warningOf(twoViewpoints, 'THIN_NECK')).toBeUndefined()
+
+      // C を足すと、三角形の頂点近くの細さが THIN_NECK として出る。
+      // この組み合わせでは B（正方形）がどの高さでも幅を狭めないため、
+      // C のほぼ全域が実際に live な高さから到達可能で、この特定の三つ組では
+      // 「live 制限」をかけても数値そのものは変わらない（後述のテストが
+      // 「live 制限しないと変わる」ケースを別途, 数値が変わらないことは
+      // バグではなく、この三つ組固有の事実であることをコメントで明示する）
+      const withC = runPreflight(a, b, { c })
+      const warning = warningOf(withC, 'THIN_NECK')
+      expect(warning).toBeDefined()
+      expect(warning!.minWidth).toBeCloseTo(0.0045105489780441176, 9)
+    })
+
+    it('C の到達不能な領域（B が到達しない w）は THIN_NECK の細さに数えない', () => {
+      // A: 全高・全面の正方形（幅 10 の帯、y∈[0,10]）
+      // B: 左右 2 本の帯（x∈[-5,-4] と [4,5]）。**高さによらず同じ形**なので
+      //    走査線サンプリングが取りこぼす余地はない（Finding 2 とは無関係に
+      //    Finding 3 だけを切り出すための構成）
+      // C: 上下は B の帯とちょうど噛み合う幅の広い矩形（x∈[-5,5]）、
+      //    中央（w∈(-4,4)）だけ幅 0.001 の細い腰。B は w∈(-4,4) を
+      //    どの高さでも一度も許さないため、この腰は**理論上どの高さからも
+      //    到達できない** — 旧実装はここを「全 w の最小」として拾ってしまう
+      const a: Contour[] = [rect(-5, 0, 5, 10)]
+      const b: Contour[] = [rect(-5, 0, -4, 10), rect(4, 0, 5, 10)]
+      const c: Contour[] = [rect(-5, -5, 5, -4), rect(-0.0005, -4, 0.0005, 4), rect(-5, 4, 5, 5)]
+
+      const twoViewpoints = runPreflight(a, b)
+      const withC = runPreflight(a, b, { c })
+
+      // 2 視点では B の帯幅（1）自体が THIN_NECK の閾値を超えるため警告なし。
+      // C の腰（幅 0.001）を正しく「到達不能」として除外できていれば、
+      // 3 視点でも THIN_NECK は出ない — 出た場合、その値は腰の幅
+      // （0.001）に極端に近くなるはずなので、そちらでも検出できる
+      const twoTN = warningOf(twoViewpoints, 'THIN_NECK')
+      const threeTN = warningOf(withC, 'THIN_NECK')
+      expect(twoTN).toBeUndefined()
+      expect(threeTN).toBeUndefined()
+    })
+  })
+
+  describe('斜交軸 × 2 視点は Finding 1 の対象外（1 バイトも変わらない）', () => {
+    it('C なしなら axisAngleDeg を変えても preflight の結果は変わらない', () => {
+      const square = normalizeSilhouette([rect(-1, -1, 1, 1)], 2).contours
+      const star = normalizeSilhouette(presetToContours('star'), 2).contours
+
+      const at90 = runPreflight(square, star, { axisAngleDeg: 90 })
+      const at45 = runPreflight(square, star, { axisAngleDeg: 45 })
+      const noAngle = runPreflight(square, star)
+
+      expect(at45).toEqual(at90)
+      expect(noAngle).toEqual(at90)
+    })
+  })
+
+  describe('2 視点の基準挙動は不変（自己比較ではなく解析解と実 CSG に対して固定）', () => {
+    it('正方形（一辺 2）× 円（半径 1）：警告なし・live 帯が bbox 全体・実体積が解析解 2π と一致', () => {
+      const square = [rect(-1, -1, 1, 1)]
+      const circleContour: Contour = (() => {
+        const pts: number[] = []
+        for (let k = 0; k < 64; k++) {
+          const t = (2 * Math.PI * k) / 64
+          pts.push(Math.cos(t), Math.sin(t))
+        }
+        return { points: new Float64Array(pts), isHole: false }
+      })()
+
+      const report = runPreflight(square, [circleContour])
+      // ハードコードした期待値そのものに対する固定（他の runPreflight 呼び出しとの
+      // 比較ではないので、2 視点の経路が丸ごと壊れても検出できる）
+      expect(report.ok).toBe(true)
+      expect(report.warnings).toEqual([])
+      expect(report.sharedYRange).toEqual([-1, 1])
+      // liveYRange は走査線セルの中点なので、両端はちょうど半セルぶん内側
+      // （(hi-lo)/SCANLINE_COUNT/2 = 2/256/2 = 0.00390625）に収まる
+      const step = 2 / SCANLINE_COUNT
+      expect(report.liveYRange![0]).toBeCloseTo(-1 + step / 2, 9)
+      expect(report.liveYRange![1]).toBeCloseTo(1 - step / 2, 9)
+      expect(report.estimatedComponents).toBe(1)
+
+      const response = performCsg(wasm, buildRequest({ a: square, b: [circleContour] }))
+      expect(response.ok).toBe(true)
+      if (!response.ok) return
+      expect(response.componentCount).toBe(1)
+      // 解析解 V = π r² s = π・1²・2 = 2π（csg.integration.test.ts と同じ導出）
+      expect(Math.abs(response.volume - 2 * Math.PI) / (2 * Math.PI)).toBeLessThan(0.02)
+    })
   })
 })
