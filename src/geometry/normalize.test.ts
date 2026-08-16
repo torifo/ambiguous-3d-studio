@@ -268,3 +268,89 @@ describe('normalizeSilhouette', () => {
     })
   })
 })
+
+describe('縮退判定はスケール相対（絶対面積しきい値の廃止）', () => {
+  it('一辺 1e-7 の正方形（絶対面積 1e-14）でも巻き方向を判定できる', () => {
+    // 旧実装は |面積| < 1e-12 の絶対しきい値でこれを拒否していた。
+    // 相対面積（面積 / bbox 面積）は 1 なので、縮退でも何でもない
+    const [outer] = normalizeWinding([rectCW(0, 0, 1e-7, 1e-7, false)])
+    expect(signedArea(outer.points)).toBeGreaterThan(0)
+    expect(outer.isHole).toBe(false)
+  })
+
+  it('厳密にゼロ面積（スパイク状に往復する輪郭）を拒否する', () => {
+    // (0,0)→(2,0)→(2,2)→(2,0)：一直線ではない（bbox は 2×2）が、
+    // 行って戻る「スパイク」で塗り面積は厳密にゼロ
+    const spike = contour([0, 0, 2, 0, 2, 2, 2, 0])
+    expect(() => normalizeWinding([spike])).toThrow(/面積|巻き方向/)
+  })
+
+  it('完全に一直線（対角線上）の輪郭を拒否する', () => {
+    const diagonal = contour([0, 0, 1, 1, 2, 2, 3, 3])
+    expect(() => normalizeWinding([diagonal])).toThrow(/面積|巻き方向/)
+  })
+
+  it('完全に一直線（水平・bbox 高さゼロ）の輪郭を拒否する', () => {
+    const horizontal = contour([0, 5, 2, 5, 4, 5])
+    expect(() => normalizeWinding([horizontal])).toThrow(/面積|巻き方向/)
+  })
+
+  it('相対面積が極小のスリバー（ほぼ一直線の三角形）を拒否する', () => {
+    // 三角形 (0,0)-(4, 2+1e-12)-(8,4)：中央の頂点が対角線から 1e-12 だけ外れている。
+    // 面積 ≈ 4e-12、bbox 面積 = 32 → 相対面積 ≈ 1.25e-13。
+    //
+    // しきい値 REL_AREA_EPS = 1e-10 の根拠：単位 bbox 座標でのシューレース和の
+    // float64 丸め誤差は約 n × 2.2e-16（頂点数 n が 10^4 級の密なパスでも ~1e-11）。
+    // その上限より 1 桁強の余裕を取った値で、これ未満の相対面積の「巻き」は
+    // 数値ノイズと区別できず、通すと下流の CrossSection fill を無言で壊す。
+    // 一方、意味のある塗り領域は（どんなに細長い矩形でも）相対面積がオーダー 1
+    // なので、実在の形をこのしきい値で失うことはない
+    const sliver = contour([0, 0, 4, 2 + 1e-12, 8, 4])
+    expect(() => normalizeWinding([sliver])).toThrow(/面積|巻き方向/)
+  })
+})
+
+describe('normalizeSilhouette のスケール不変性（FR-010）', () => {
+  const H = 2
+
+  /** 一辺 side の CW 正方形（原点隅）を正規化する。両極端で同一のコードパスを通す */
+  function normalizeSquare(side: number) {
+    return normalizeSilhouette([rectCW(0, 0, side, side, false)], H)
+  }
+
+  it('一辺 1e-7 の正方形が高さ H・中心原点・CCW に正規化される', () => {
+    const { contours } = normalizeSquare(1e-7)
+    const bounds = boundsOf(contours)
+    expect(bounds.maxY - bounds.minY).toBeCloseTo(H, TOL)
+    expect((bounds.minX + bounds.maxX) / 2).toBeCloseTo(0, TOL)
+    expect((bounds.minY + bounds.maxY) / 2).toBeCloseTo(0, TOL)
+    expect(signedArea(contours[0].points)).toBeGreaterThan(0)
+  })
+
+  it('一辺 1e7 の正方形も同様に正規化される（もう一方の極端）', () => {
+    const { contours } = normalizeSquare(1e7)
+    const bounds = boundsOf(contours)
+    expect(bounds.maxY - bounds.minY).toBeCloseTo(H, TOL)
+    expect((bounds.minX + bounds.maxX) / 2).toBeCloseTo(0, TOL)
+    expect((bounds.minY + bounds.maxY) / 2).toBeCloseTo(0, TOL)
+    expect(signedArea(contours[0].points)).toBeGreaterThan(0)
+  })
+
+  it('1e-7 と 1e7 の同じ形は同一の正規化結果になる（スケール不変性）', () => {
+    // これが本質の性質：正規化は入力の単位系に依存しない。
+    // 同じ形を 14 桁離れたスケールで与えても、頂点単位で一致する
+    const tiny = normalizeSquare(1e-7).contours[0].points
+    const huge = normalizeSquare(1e7).contours[0].points
+    expect(tiny.length).toBe(huge.length)
+    for (let i = 0; i < tiny.length; i++) {
+      expect(tiny[i]).toBeCloseTo(huge[i], TOL)
+    }
+  })
+
+  it('高さが非正規化数級でスケールがオーバーフローする入力は明確に拒否する', () => {
+    // 幅 1 × 高さ 1e-320 の矩形：相対面積は ~1 なので巻きは判定できるが、
+    // scale = 2 / 1e-320 が Infinity になり NaN 座標を生むため、フィット段階で拒否する
+    const thin = contour([0, 0, 1, 0, 1, 1e-320, 0, 1e-320])
+    expect(() => normalizeSilhouette([thin], H)).toThrow(/スケール|高さ/)
+  })
+})

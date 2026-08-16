@@ -19,8 +19,28 @@ export interface Bounds {
   maxY: number
 }
 
-/** 面積・高さの縮退判定に使う許容誤差 */
-const EPS = 1e-12
+/**
+ * 巻き方向判定の縮退しきい値（スケール相対・無次元）。
+ *
+ * 符号付き面積は座標絶対値の **2 乗**でスケールするため、絶対値での
+ * しきい値（旧 `1e-12`）は「入力がどの単位系か」への暗黙の仮定になる：
+ * 一辺 1e-7 の正方形（面積 1e-14）は完全に有効な形なのに拒否されていた。
+ * FR-010 はスケール非依存（任意の入力を共通高さへフィット）なので、
+ * 判定も無次元の比で行う。
+ *
+ * 判定は輪郭を自身の bbox 中心へ平行移動し、長辺 `ext = max(w, h)` で
+ * 割った「単位 bbox 座標」上で行う（`windingMeasure` 参照）。この座標系では
+ * - シューレース和の丸め誤差は約 n × ε（ε ≈ 2.2e-16）× O(1)。
+ *   頂点数 n が 10^4 級の密なパスでも誤差は ~1e-11 に収まる。
+ * - 意味のある塗り領域は（極端に細長い矩形でも）bbox 面積比でオーダー 1。
+ *   これを大きく下回るのは「ほぼ完全に一直線」な点列だけで、その巻きは
+ *   数値ノイズと区別できず、通すと CrossSection の fill を静かに壊す。
+ *
+ * よって丸め誤差の上限より 1 桁強の余裕を取った 1e-10 を採用する。
+ * 緩めすぎると巻きが数値的に無意味なスリバーを通してしまうため、
+ * これ以上は下げないこと。
+ */
+const REL_AREA_EPS = 1e-10
 
 /**
  * 入力検証。縮退した輪郭は NaN を生む前にここで弾く。
@@ -56,8 +76,10 @@ function assertValidContours(contours: Contour[]): void {
 }
 
 /**
- * 単一輪郭の符号付き面積（シューレース公式）。
- * Y 上向き座標系で CCW なら正、CW なら負。巻き方向判定の基礎。
+ * 単一輪郭の符号付き面積（シューレース公式、生の座標のまま）。
+ * Y 上向き座標系で CCW なら正、CW なら負。
+ * 巻き方向の**判定**には、桁落ちに強い内部の `windingMeasure` を使う
+ * （原点から遠い・極端なスケールの輪郭では生のシューレース和は桁落ちする）。
  */
 export function signedArea(points: Float64Array): number {
   const n = points.length / 2
@@ -103,24 +125,79 @@ function reversePoints(points: Float64Array): Float64Array {
 }
 
 /**
+ * 巻き方向判定のための頑健な符号付き面積の測定。
+ *
+ * 生のシューレース和は座標絶対値の 2 乗オーダーの項の相殺で成り立つため、
+ * 原点から遠い・極端に小さい／大きい輪郭では桁落ちして符号すら信用できない。
+ * ここでは輪郭を自身の bbox 中心へ平行移動し、長辺 `ext = max(w, h)` で
+ * 一様に割った「単位 bbox 座標」で面積を計算する。平行移動と正の一様スケールは
+ * 符号付き面積の符号を変えないので、巻き方向判定にはこの値を使ってよい。
+ * すべての量が O(1) になるため、アンダーフロー／オーバーフローも起きない。
+ *
+ * @returns unitArea — 単位 bbox 座標での符号付き面積（巻き判定用）
+ * @returns relArea — 単位 bbox 面積に対する |面積| の比（縮退判定用・無次元）。
+ *                    bbox の幅か高さがゼロ（一点・軸平行の一直線）なら 0
+ */
+function windingMeasure(points: Float64Array): { unitArea: number; relArea: number } {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (let i = 0; i < points.length; i += 2) {
+    const x = points[i]
+    const y = points[i + 1]
+    if (x < minX) minX = x
+    if (x > maxX) maxX = x
+    if (y < minY) minY = y
+    if (y > maxY) maxY = y
+  }
+  const w = maxX - minX
+  const h = maxY - minY
+  // 幅か高さがゼロ → 面積は厳密にゼロ（一点、または軸平行の一直線）
+  if (!(w > 0) || !(h > 0)) return { unitArea: 0, relArea: 0 }
+  const ext = Math.max(w, h)
+  const cx = (minX + maxX) / 2
+  const cy = (minY + maxY) / 2
+  const n = points.length / 2
+  let sum = 0
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n
+    const xi = (points[2 * i] - cx) / ext
+    const yi = (points[2 * i + 1] - cy) / ext
+    const xj = (points[2 * j] - cx) / ext
+    const yj = (points[2 * j + 1] - cy) / ext
+    sum += xi * yj - xj * yi
+  }
+  const unitArea = sum / 2
+  const relArea = Math.abs(unitArea) / ((w / ext) * (h / ext))
+  return { unitArea, relArea }
+}
+
+/**
  * 巻き方向の正規化：外輪郭 CCW（符号付き面積が正）/ 穴 CW（負）。
  * どちらが穴かは `Contour.isHole` が真実の情報源で、実際の巻きが
  * `isHole` と食い違う輪郭だけ頂点順を反転する。
  *
- * 面積がほぼゼロの輪郭は巻き方向を判定できないため縮退として弾く。
+ * 縮退判定は**スケール相対**：面積の絶対値ではなく、輪郭自身の bbox
+ * 面積に対する比（`REL_AREA_EPS`）で行う。これにより一辺 1e-7 でも 1e7 でも
+ * 有効な形は同じように通り（FR-010 のスケール非依存性）、厳密なゼロ面積・
+ * 完全な一直線・bbox に対して面積が極小で巻きを浮動小数点で判定できない
+ * スリバーは従来どおり拒否する。
  */
 export function normalizeWinding(contours: Contour[]): Contour[] {
   assertValidContours(contours)
   return contours.map((contour, c) => {
-    const area = signedArea(contour.points)
-    if (Math.abs(area) < EPS) {
+    const { unitArea, relArea } = windingMeasure(contour.points)
+    // `!(relArea > ...)` の形にして NaN も確実に拒否側へ倒す
+    if (!(relArea > REL_AREA_EPS)) {
       throw new Error(
-        `normalize: contour[${c}] の符号付き面積がほぼゼロ（${area}）で、巻き方向を判定できません`,
+        `normalize: contour[${c}] の符号付き面積が bbox に対してほぼゼロ` +
+          `（相対面積 ${relArea} ≤ しきい値 ${REL_AREA_EPS}）で、巻き方向を判定できません`,
       )
     }
     // 外輪郭は正（CCW）、穴は負（CW）であるべき
     const wantPositive = !contour.isHole
-    const isPositive = area > 0
+    const isPositive = unitArea > 0
     if (wantPositive === isPositive) return contour
     return { points: reversePoints(contour.points), isHole: contour.isHole }
   })
@@ -164,12 +241,22 @@ export function fitToHeight(contours: Contour[], targetHeight: number): Contour[
   }
   const bounds = boundsOf(contours)
   const height = bounds.maxY - bounds.minY
-  if (!(height > EPS)) {
+  // 高さの縮退判定もスケール絶対のしきい値を置かない（FR-010）：
+  // 厳密にゼロの高さだけを拒否し、正の高さは大小を問わず受け付ける。
+  if (!(height > 0)) {
     throw new Error(
       `normalize: bbox の高さがゼロ（${height}）です。高さのない輪郭はフィットできません`,
     )
   }
   const scale = targetHeight / height
+  // 高さが非正規化数級に小さいと除算がオーバーフローし NaN 座標を生むため、
+  // ここで明確に拒否する（「NaN を作らない」不変条件の維持）
+  if (!Number.isFinite(scale)) {
+    throw new Error(
+      `normalize: スケール係数が非有限（${scale}）です。bbox の高さ（${height}）が` +
+        ` targetHeight（${targetHeight}）に対して極端すぎるためフィットできません`,
+    )
+  }
   // スケール後の bbox 中心を原点へ
   const cx = ((bounds.minX + bounds.maxX) / 2) * scale
   const cy = ((bounds.minY + bounds.maxY) / 2) * scale
