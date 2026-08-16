@@ -206,14 +206,25 @@ export interface StudioState {
   setWarnings: (epoch: number, warnings: PreflightWarning[]) => void
 }
 
-/** 状態機械の遷移表。「現在の状態 → 到達してよい状態」以外は no-op */
+/**
+ * 状態機械の遷移表。「現在の状態 → 到達してよい状態」以外は no-op。
+ *
+ * `init-failed` は**どの状態からも到達できる**。Wasm エンジンは起動時だけでなく
+ * 実行中にも死にうるため（Worker のクラッシュ → 再生成 → 再初期化の失敗）。
+ *
+ * これを `loading-wasm` からのみ到達可能にしていたとき、生成中にエンジンが
+ * 死ぬと次のデッドロックが起きた：ストアは通常の生成失敗として `error` に入り、
+ * そこからは `init-failed` にも `loading-wasm` にも遷移できないため再試行が
+ * 永久に no-op になる。クライアントは `init-failed` を表示しているのにストアは
+ * `error` のままという、UI が実態を表現できない状態になる。
+ */
 const ALLOWED: Record<StudioStatus, readonly StudioStatus[]> = {
   'loading-wasm': ['ready', 'init-failed'],
-  ready: ['generating'],
+  ready: ['generating', 'init-failed'],
   // generating → generating は supersede（実行中の生成の置き換え）
-  generating: ['success', 'error', 'generating'],
-  success: ['generating'],
-  error: ['generating'],
+  generating: ['success', 'error', 'generating', 'init-failed'],
+  success: ['generating', 'init-failed'],
+  error: ['generating', 'init-failed'],
   'init-failed': ['loading-wasm'],
 }
 

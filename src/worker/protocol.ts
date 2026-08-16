@@ -62,9 +62,39 @@ export type CsgResponse =
     }
   | { generation: number; ok: false; error: CsgError }
 
-/** Worker 内で起きうる失敗の分類 */
+/**
+ * CSG 生成が失敗しうる分類。
+ *
+ * `WORKER_CRASHED` は Worker 内で起きるのではなく、Worker が死んだことを
+ * メインスレッド側が検出して発行する。それでもこの union に含めるのは、
+ * **ストアの `generationFailed` が受け取れる型が 1 つでなければならない**ため。
+ * クライアント専用の別 union を作ると、Wave 4 がクラッシュを無関係なエラーに
+ * 読み替えるか、キャストで型を潰すしかなくなる。
+ */
 export type CsgError =
   | { code: 'WASM_INIT_FAILED'; detail: string }
   | { code: 'NOT_MANIFOLD'; detail: string }
   | { code: 'EMPTY_RESULT' }
   | { code: 'INVALID_INPUT'; detail: string }
+  | { code: 'WORKER_CRASHED'; detail: string }
+
+/**
+ * Worker → メインスレッド。生成結果とは別系統の、初期化ライフサイクル通知。
+ *
+ * これがないと、クライアントは「準備完了」を推測するしかない。実際に
+ * ウォームアップ生成の**成否を問わず** ready と見なす実装になっていたため、
+ * エンジン側の異常で `INVALID_INPUT` が返っても正常起動として扱われていた。
+ * Worker が `setup()` 直後に明示的に通知することで、準備完了の判定が
+ * 推測ではなく事実になる。
+ */
+export type WorkerLifecycleMessage =
+  | { type: 'ready' }
+  | { type: 'init-failed'; detail: string }
+
+/** Worker から届きうるメッセージの全体 */
+export type WorkerOutbound = CsgResponse | WorkerLifecycleMessage
+
+/** ライフサイクル通知か生成レスポンスかを判別する */
+export function isLifecycleMessage(message: WorkerOutbound): message is WorkerLifecycleMessage {
+  return 'type' in message
+}
