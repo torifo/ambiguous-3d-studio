@@ -61,6 +61,18 @@ export interface IllusionPreset {
   c?: SilhouetteSource
   /** 視点 B の軸角（度）。既定 90 = 直交。45 はアンビギュアス・シリンダー系（FR-102） */
   axisAngleDeg?: number
+  /**
+   * 仮想ミラー（FR-024 / FR-102）。**装飾ではなく、この錯視の成立機構**
+   * であるときだけ設定する（アンビギュアス・シリンダー／トランプマーク
+   * の変身立体 — 「直接見える形」と「鏡に映る形」が異なって初めて成立する）。
+   * 省略 = ミラーなし。`store/useStudioStore.ts` の `applyInput` が
+   * `StudioInputSpec.mirror` としてそのまま読み、有効・無効とオフセットを
+   * カタログ選択と同じトランザクションで確定させる（`ui/Gallery.tsx` は
+   * `applyInput(entry.preset)` を構造そのまま渡すだけなので無編集で反映される）。
+   * 向き（どちらを映すか）は axisAngleDeg から自動導出するため、ここでは
+   * 有効化と任意のオフセットしか指定しない（scene/VirtualMirror.tsx）。
+   */
+  mirror?: { enabled: boolean; offset?: number }
 }
 
 /** カタログ 1 項目（specs/ambiguous-solid/illusion-catalogue.md「カタログ項目の定義」） */
@@ -132,6 +144,9 @@ export const ILLUSIONS: readonly IllusionEntry[] = [
     preset: {
       a: { kind: 'preset', id: 'spade' },
       b: { kind: 'preset', id: 'heart' },
+      // 原典は「90° 回す」だが、このスタジオでは仮想ミラーが同じ驚きを
+      // 手回し抜きで見せる — 正面に♠を見せたまま、鏡の中に♥が同時に映る
+      mirror: { enabled: true },
     },
     credit: '杉原厚吉（明治大学）の「変身立体」シリーズに同種の作品がある。',
   },
@@ -183,6 +198,10 @@ export const ILLUSIONS: readonly IllusionEntry[] = [
       a: { kind: 'preset', id: 'square' },
       b: { kind: 'preset', id: 'circle' },
       axisAngleDeg: 45,
+      // この項目の phenomenon（「その奥に置いた鏡に映った姿は丸い筒」）は
+      // 鏡が実際に丸を映すことを前提に書かれている — 鏡は装飾ではなく
+      // この錯視の成立機構そのものなので、選択した瞬間に自動で有効化する
+      mirror: { enabled: true },
     },
     credit: '杉原厚吉「Ambiguous Cylinder Illusion」（2016）。',
   },

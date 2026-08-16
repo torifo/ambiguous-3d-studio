@@ -102,12 +102,22 @@ export interface StudioInput {
  * `illusion-catalogue.md` の `IllusionEntry['preset']` と同じ形なので、
  * カタログのエントリをそのまま {@link StudioState.applyInput} に渡せる。
  * 省略したフィールドは既定（C なし・直交 90°）になる。
+ *
+ * `mirror` は「仮想ミラーは装飾ではなく錯視の成立機構そのもの」という方針の
+ * 実装点（アンビギュアス・シリンダー／トランプマークの変身立体はミラー越しに
+ * 別のシルエットを見せて初めて成立する）。カタログ項目（`IllusionPreset`。
+ * catalogue/illusions.ts）が持つ同名フィールドがそのままここに渡る —
+ * Gallery.tsx は `applyInput(entry.preset)` を構造をいじらず渡すだけなので、
+ * `IllusionPreset` にフィールドを足せば Gallery 側の変更なしに反映される。
+ * 省略時は無効（ミラー OFF）— ミラーを使わない項目を選んだときに、直前の
+ * 項目で有効化されたミラーが残留して見えてしまう事故を防ぐ。
  */
 export interface StudioInputSpec {
   a: SilhouetteSource
   b: SilhouetteSource
   c?: SilhouetteSource | null
   axisAngleDeg?: number
+  mirror?: { enabled: boolean; offset?: number }
 }
 
 /** FR-102 の軸角の範囲へ丸める。非有限は既定（90°）に落とす */
@@ -120,6 +130,13 @@ export function clampAxisAngleDeg(deg: number): number {
 export interface StudioOptions {
   /** 仮想ミラー（FR-024） */
   virtualMirror: boolean
+  /**
+   * 仮想ミラーのオフセット（作業座標、既定 {@link DEFAULT_MIRROR_OFFSET}）。
+   * 向き（回転）は axisAngleDeg から自動導出するため設定項目に含めない
+   * （scene/VirtualMirror.tsx）— ユーザーが調整できるのは「鏡をどれだけ
+   * 離すか」だけで、「どちらを向くか」は錯視の成立条件そのものなので固定する。
+   */
+  mirrorOffset: number
   /** 台座（FR-015）。既定で無効 */
   baseplate: { enabled: boolean; thicknessMm: number }
   /** 実寸の共通シルエット高さ mm（FR-029。既定 60、範囲 10〜300） */
@@ -142,6 +159,22 @@ export interface GenerationSummary {
 export const MIN_BASEPLATE_MM = 0.5
 export const MAX_BASEPLATE_MM = 5.0
 export const DEFAULT_BASEPLATE_MM = 2.0
+
+/**
+ * 仮想ミラーのオフセット範囲（作業座標、mm ではない）。既定 3.2 は従来の
+ * 直交専用実装がそのまま使っていた値（scene/VirtualMirror.tsx の導出を参照）。
+ * 下限 2.5 はプリセット立体（半径 ~1.5 程度）との交差を避ける安全マージン、
+ * 上限 6.0 は鏡が画面から見えなくなるほど離れすぎないための実用上限。
+ */
+export const MIN_MIRROR_OFFSET = 2.5
+export const MAX_MIRROR_OFFSET = 6.0
+export const DEFAULT_MIRROR_OFFSET = 3.2
+
+/** ミラーオフセットの範囲へ丸める。非有限は既定に落とす */
+export function clampMirrorOffset(offset: number): number {
+  if (!Number.isFinite(offset)) return DEFAULT_MIRROR_OFFSET
+  return Math.min(MAX_MIRROR_OFFSET, Math.max(MIN_MIRROR_OFFSET, offset))
+}
 
 /** FR-006: 「形状をリセット」の初期値。FR-025 の初期生成にも使う */
 export const INITIAL_INPUT: StudioInput = {
@@ -262,6 +295,8 @@ export interface StudioState {
 
   // ---- オプションのアクション ----
   setVirtualMirror: (enabled: boolean) => void
+  /** {@link clampMirrorOffset} の範囲へ丸めて反映する */
+  setMirrorOffset: (offset: number) => void
   setBaseplateEnabled: (enabled: boolean) => void
   setBaseplateThicknessMm: (mm: number) => void
   /** FR-029 の範囲（10〜300mm、刻み 1mm）へ丸めて反映する */
@@ -345,6 +380,7 @@ const studioStateCreator: StateCreator<StudioState> = (set, get) => ({
   lastValidInput: INITIAL_INPUT,
   options: {
     virtualMirror: false,
+    mirrorOffset: DEFAULT_MIRROR_OFFSET,
     baseplate: { enabled: false, thicknessMm: DEFAULT_BASEPLATE_MM },
     heightMm: DEFAULT_HEIGHT_MM,
   },
@@ -437,6 +473,15 @@ const studioStateCreator: StateCreator<StudioState> = (set, get) => ({
         c: spec.c ?? null,
         axisAngleDeg: clampAxisAngleDeg(spec.axisAngleDeg ?? DEFAULT_AXIS_ANGLE_DEG),
       },
+      // 仮想ミラーは装飾ではなく錯視の成立機構（アンビギュアス・シリンダー等）
+      // なので、カタログ項目の選択と同じトランザクションで確定させる。
+      // spec.mirror 省略 = ミラーを使わない項目 → 明示的に無効化する
+      // （直前に選んだミラー項目の有効化が残留して見えるのを防ぐ）
+      options: {
+        ...s.options,
+        virtualMirror: spec.mirror?.enabled ?? false,
+        mirrorOffset: clampMirrorOffset(spec.mirror?.offset ?? DEFAULT_MIRROR_OFFSET),
+      },
     })),
 
   resetShapes: () =>
@@ -466,6 +511,9 @@ const studioStateCreator: StateCreator<StudioState> = (set, get) => ({
 
   setVirtualMirror: (enabled) =>
     set((s) => ({ options: { ...s.options, virtualMirror: enabled } })),
+
+  setMirrorOffset: (offset) =>
+    set((s) => ({ options: { ...s.options, mirrorOffset: clampMirrorOffset(offset) } })),
 
   setBaseplateEnabled: (enabled) =>
     set((s) => ({

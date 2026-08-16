@@ -2,7 +2,7 @@
  * 「これは何と何からできている？」パズルパネル（副次要素。puzzle/puzzle.ts の UI）。
  *
  * 出題・採点のロジックは一切ここに持たない — `generatePuzzleQuestion` と
- * `puzzleReducer`（puzzle/puzzle.ts）をそのまま呼ぶだけ。このパネルの責務は 3 つ:
+ * `puzzleReducer`（puzzle/puzzle.ts）をそのまま呼ぶだけ。このパネルの責務は 4 つ:
  *
  * 1. 出題された正解ペアを、既存のスタジオストアへ **同じ `applyInput` 経路**で
  *    流し込む（Gallery.tsx と同じ 1 トランザクション契約）。生成・描画は
@@ -16,6 +16,26 @@
  *    — 出題ペアがそのままフォームの選択状態として見えてしまうと、
  *    見た瞬間に答えが分かってしまうため。ここでは何もしなくてよいが、
  *    「なぜこの画面に SilhouettePicker が無いのか」の理由はここに書いておく。
+ * 4. **出題は必ず俯瞰（iso）から**。カメラ・ビューポートは全モード共通の
+ *    単一インスタンスで、カメラの状態はモード切り替えを跨いで生き残る
+ *    （scene/Viewport.tsx 冒頭）。自由モードで 正面 (A) / 側面 (B) 等の
+ *    正射影スナップへ切り替えた**あとに**クイズタブへ移ると、その正射影が
+ *    そのまま残り、答えのシルエットが最初から画面に出てしまう
+ *    （adversarial review で確認された欠陥）。`<Sidebar />` はパズルモード中
+ *    マウントされないためスナップボタンには到達できないが、直前のモードで
+ *    押されたスナップの**残留状態**はここで能動的に打ち消す必要がある —
+ *    出題（初回・「次の問題へ」の両方）のたびに `requestSnap('iso')` を呼ぶ。
+ *    回答後は逆に、正面 / 側面へのスナップを**ご褒美として**このパネルから
+ *    提供する（`REVEAL_BUTTONS`）— 正解を見る唯一の経路をここに限定する。
+ * 5. **カメラの演出モードを解除すること**。「常に回転できるとすぐに
+ *    ネタバラシになる」はカタログ向けの制約で、クイズは逆 — 立体を
+ *    あらゆる角度から調べること自体がパズルなので、自由回転は必須。
+ *    マウント時に `curatedMode` / `rotationLocked` を両方解除する
+ *    （scene/CameraRig.tsx 冒頭のコメントを参照。App.tsx / Gallery.tsx を
+ *    編集せずにモード連動を実現する唯一の観測点がこのマウント境界のため）。
+ *    A / B スナップそのものを封鎖する（責務 4 の話）のとは別の軸の制約で、
+ *    自由回転の可否は封鎖しない — 立体を眺め回すことと、正解シルエットへ
+ *    正確にスナップすることは別の操作である。
  */
 /* eslint-disable react-refresh/only-export-components --
  * `pairToInputSpec` / `optionLabel` を純関数として export し、Node の Vitest
@@ -32,6 +52,7 @@ import {
   type PuzzlePair,
 } from '../puzzle/puzzle'
 import { useStudioStore, type StudioInputSpec } from '../store/useStudioStore'
+import { useViewerStore, type SnapView } from '../scene/SweetSpot'
 
 /**
  * プリセット id → 表示名。SilhouettePicker.tsx が同内容の `PRESET_LABELS` を
@@ -82,18 +103,50 @@ function randomSeed(): string {
   return `puzzle-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
+/**
+ * 回答後に「正解のシルエットを見る」ためのスナップボタン（ご褒美。ファイル
+ * 冒頭コメントの責務 4）。視点 C はパズルが使わないため top は含めない
+ * （`pairToInputSpec` の doc comment を参照）。
+ */
+const REVEAL_BUTTONS: ReadonlyArray<{ view: SnapView; label: string }> = [
+  { view: 'front', label: '正面 (A)' },
+  { view: 'side', label: '側面 (B)' },
+]
+
 /** パズルパネル。App.tsx はこれを `<PuzzlePanel />` として置くだけでよい */
 export function PuzzlePanel() {
   const applyInput = useStudioStore((s) => s.applyInput)
+  const requestSnap = useViewerStore((s) => s.requestSnap)
   const [seed] = useState(randomSeed)
   const indexRef = useRef(0)
   const startedAtRef = useRef(0)
   const [session, dispatch] = useReducer(puzzleReducer, createInitialPuzzleSession())
 
+  // 責務 5（ファイル冒頭）：クイズは自由回転が必須（調べること自体がパズル）
+  // なので、マウント中は curatedMode / rotationLocked を両方解除する。
+  // 下の「初回出題」effect より先に実行される必要がある —
+  // curatedMode が true のまま loadQuestion → applyInput が走ると、
+  // scene/CameraRig.tsx の自動演出（視点 A への強制スナップ）が誤発火し、
+  // 直後の requestSnap('iso') と競合する。宣言順で先に置くことで保証する
+  useEffect(() => {
+    const store = useViewerStore.getState()
+    store.setCuratedMode(false)
+    store.setRotationLocked(false)
+    return () => {
+      useViewerStore.getState().setCuratedMode(true)
+    }
+  }, [])
+
   /**
-   * 出題 → ストア反映 → 時計スタート、を 1 セットで行う。
+   * 出題 → ストア反映 → 時計スタート → 俯瞰へ強制、を 1 セットで行う。
    * `applyInput` はレンダー中に呼んではいけない（外部ストアへの書き込みは
    * effect からのみ行う）ため、この関数自体も effect / イベントハンドラからだけ呼ぶ。
+   *
+   * `requestSnap('iso')` が必須な理由（ファイル冒頭の責務 4）：ビューポートは
+   * 全モード共通の単一インスタンスで、カメラの投影・向きはモード切り替えを
+   * 跨いで保持される。自由モードで 正面 (A) 等の正射影スナップへ切り替えた
+   * 状態のままクイズタブへ来ると、この呼び出しがない限り答えのシルエットが
+   * 最初から画面に出てしまう。
    */
   const loadQuestion = useCallback(
     (index: number): void => {
@@ -103,8 +156,9 @@ export function PuzzlePanel() {
       startedAtRef.current = performance.now()
       const correct = question.options[question.correctOptionIndex]
       applyInput(pairToInputSpec(correct))
+      requestSnap('iso')
     },
-    [seed, applyInput],
+    [seed, applyInput, requestSnap],
   )
 
   // 初回出題は 1 回だけ。以降は「次の問題へ」ボタン（handleNext）から呼ぶ
@@ -208,6 +262,30 @@ export function PuzzlePanel() {
                 ? '正解です。'
                 : `不正解です。正解は「${optionLabel(question.options[question.correctOptionIndex])}」でした。`}
           </p>
+
+          {/*
+            回答後だけのご褒美（ファイル冒頭の責務 4）。正面 / 側面へのスナップを
+            出題中は一切提供しない（`<Sidebar />` 自体がパズルモードでは
+            マウントされないため到達できない）ことで「回答前にシルエットを
+            見る手段がない」を構造的に保証し、回答後はここから素直に見せる。
+          */}
+          {answered && (
+            <div className="flex flex-col gap-1.5">
+              <p className="text-[11px] text-neutral-500">正解のシルエットを見る:</p>
+              <div className="flex gap-1.5">
+                {REVEAL_BUTTONS.map(({ view, label }) => (
+                  <button
+                    key={view}
+                    type="button"
+                    onClick={() => requestSnap(view)}
+                    className="min-h-11 flex-1 rounded border border-neutral-600 px-3 text-xs text-neutral-200 hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {answered && (
             <button

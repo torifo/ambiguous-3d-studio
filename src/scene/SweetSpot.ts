@@ -8,19 +8,28 @@
  * する（SweetSpot.test.ts）。コンポーネント（CameraRig.tsx）は three の
  * `Vector3` をそのまま渡す（構造的に {@link Vec3Like} 互換）。
  *
- * ## カメラ規約（design.md「2.1 軸の割り当てとカメラ規約」— 拘束事項）
+ * ## カメラ規約（design.md「2.1 軸の割り当てとカメラ規約」の一般化。
+ * 唯一の幾何規約は `worker/protocol.ts` の {@link viewpointCamera} — ここは
+ * それをベクトル演算の都合がよい {@link Vec3Like} 形へ橋渡しするだけ）
  *
- * | 視点 | カメラ位置 | 前方ベクトル | up |
+ * | 視点 | カメラ位置の方向 | 前方ベクトル | up |
  * |---|---|---|---|
- * | A（正面） | **+Z 側** | (0, 0, −1) | +Y |
- * | B（側面） | **+X 側** | (−1, 0, 0) | +Y |
+ * | A（正面） | **+Z 側**（固定） | (0, 0, −1) | +Y |
+ * | B（側面） | `(sin φ, 0, cos φ)`（φ = axisAngleDeg。既定 90° で **+X 側**） | 位置の逆向き | +Y |
+ * | C（上面） | **+Y 側**（固定。軸角に依存しない） | (0, −1, 0) | **(0, 0, −1)** |
  *
- * B 用の角柱は +Z 押し出し後に Y 軸まわり +90° 回転（`(x,y,z) → (z,y,−x)`）
- * されるため、B の局所 +X は world **−Z** に載る。+X カメラ（up=+Y）の画面右は
- * `right = up × backward = (0,1,0) × (1,0,0) = (0,0,−1)` = world −Z なので
- * B の局所 +X と一致する。**カメラを −X に置くと画面右が world +Z になり、
- * B だけ左右反転する** — 寸法は合うため CSG 側のテストでは検出できず、
- * ここの定数がその規約の唯一の実装点になる。
+ * B の位置・前方は **axisAngleDeg に依存する**（FR-102）。既定 90° 以外を
+ * 直交として扱うと、A↔B の実際の角度差とずれた Sweet Spot 判定になる
+ * （45° なのに「B へ 90° ずれている」と表示される、など）。B 用の角柱は
+ * 断面ローカル +Z を Y 軸まわり φ 回転して押し出すため、局所 +X は
+ * world `(cos φ, 0, −sin φ)` に載る。カメラ位置 `(sin φ, 0, cos φ)`・
+ * up=+Y の画面右は `right = up × backward = (0,1,0) × (sin φ,0,cos φ)
+ * = (cos φ, 0, −sin φ)` = ローカル +X と一致する。**軸を挟んで逆側
+ * （`(−sin φ, 0, −cos φ)`）に置くと画面右が反転し、B だけ左右反転する**
+ * — 寸法は合うため CSG 側のテストでは検出できず、ここの実装がその規約の
+ * 唯一の実装点になる。C は真上から見下ろすため前方 (0,−1,0) が既定 up
+ * (0,1,0) と平行になり退化する。up を (0,0,−1) にしないと画面右が反転する
+ * （B の左右反転と同じ種類の事故）。
  *
  * ## store への書き込みは「変化したフレームのみ」（NFR-002 / ADR-004）
  *
@@ -32,6 +41,7 @@
  * インジケーターの数値表示は DOM を rAF から直接更新する（design.md）。
  */
 import { create } from 'zustand'
+import { DEFAULT_AXIS_ANGLE_DEG, viewpointCamera } from '../worker/protocol'
 
 /** three の `Vector3` と構造互換の読み取り専用 3 次元ベクトル */
 export interface Vec3Like {
@@ -40,11 +50,22 @@ export interface Vec3Like {
   z: number
 }
 
-/** シルエット合致の対象視点。A = 正面（+Z カメラ）/ B = 側面（+X カメラ） */
+/**
+ * シルエット合致の対象視点。**ストア（`ViewerState.matched`）で公開するのは
+ * A / B のみ**に固定してある — ui/SweetSpotIndicator.tsx の `target` 型が
+ * `'A' | 'B' | null` のままであり、ここを C まで広げるとその型契約を破る。
+ * C の合致は {@link AxisView} 側（内部専用）で扱う。
+ */
 export type SweetSpotView = 'A' | 'B'
 
-/** スナップ先。front / side は正射影へ切り替わる（FR-023）。iso は俯瞰 */
-export type SnapView = 'front' | 'side' | 'iso'
+/**
+ * カメラ数学が内部で扱う視点。ストア公開の {@link SweetSpotView}（A/B）に
+ * C を加えたもの。`viewpointCamera`（worker/protocol.ts）の引数と同じ集合。
+ */
+export type AxisView = 'A' | 'B' | 'C'
+
+/** スナップ先。front / side / top は正射影へ切り替わる（FR-023）。iso は俯瞰 */
+export type SnapView = 'front' | 'side' | 'top' | 'iso'
 
 /** 投影モード。自由探索 = perspective、視点 A/B スナップ中 = orthographic */
 export type ProjectionMode = 'perspective' | 'orthographic'
@@ -54,36 +75,101 @@ export const SWEET_SPOT_THRESHOLD_DEG = 3.5
 export const SWEET_SPOT_THRESHOLD_RAD = (SWEET_SPOT_THRESHOLD_DEG * Math.PI) / 180
 
 /**
- * 各視点の**カメラ前方ベクトル**（カメラ → 原点方向、単位ベクトル）。
- * A: +Z 側から原点を見る → (0,0,−1)。B: **+X 側**から原点を見る → (−1,0,0)。
- * `camera.getWorldDirection()` の戻り値とそのまま比較できる形で持つ。
+ * 視点の**カメラ前方ベクトル**（カメラ → 原点方向、単位ベクトル）を
+ * `viewpointCamera`（worker/protocol.ts。唯一の幾何規約）から導出する。
+ *
+ * B は axisAngleDeg に依存する — 既定 90° のときのみ従来の (−1,0,0) に
+ * **厳密一致**する（`viewpointCamera` 自身が 90° を厳密値で返すため、
+ * `Math.cos(π/2)` の丸め誤差 6.1e-17 はここにも伝播しない）。A・C は
+ * axisAngleDeg を渡しても無視される（位置が固定のため）。
  */
-export const VIEW_FORWARDS: Record<SweetSpotView, Vec3Like> = {
-  A: { x: 0, y: 0, z: -1 },
-  B: { x: -1, y: 0, z: 0 },
+export function viewForward(view: AxisView, axisAngleDeg: number = DEFAULT_AXIS_ANGLE_DEG): Vec3Like {
+  const { direction } = viewpointCamera(view, axisAngleDeg)
+  // `-0 || 0` で −0 を +0 へ正規化する（`-direction[i]` は direction[i] が
+  // 正の 0 のとき −0 になりうる。toEqual({x:0,...}) との比較を壊さないため）
+  return {
+    x: -direction[0] || 0,
+    y: -direction[1] || 0,
+    z: -direction[2] || 0,
+  }
+}
+
+/**
+ * 既定軸角（90°）での視点前方ベクトル。A・C は axisAngleDeg に依存しないため
+ * 常にこの値でよい。**B はここでは既定 90° の参照値** — 実際の判定・
+ * レンダリングは現在の axisAngleDeg を渡した {@link viewForward} を使うこと
+ * （`matchedSweetSpot` / CameraRig.tsx を参照）。
+ */
+export const VIEW_FORWARDS: Record<AxisView, Vec3Like> = {
+  A: viewForward('A'),
+  B: viewForward('B'),
+  C: viewForward('C'),
 }
 
 /** スナップ視点の定義。direction は原点 → カメラ位置の単位ベクトル */
 export interface SnapViewSpec {
-  /** 原点からカメラ位置へ向かう単位ベクトル */
+  /** 原点からカメラ位置へ向かう単位ベクトル。side は既定 90° の参照値
+   *  （実際の方向は {@link snapDirection} が axisAngleDeg を反映して返す） */
   direction: Vec3Like
   /** スナップ完了時に適用する投影（FR-023） */
   projection: ProjectionMode
-  /** この視点が対応する Sweet Spot。iso は錯視の視点ではないので null */
-  sweetSpot: SweetSpotView | null
+  /**
+   * この視点が対応する Sweet Spot（内部の離脱判定にのみ使う。CameraRig.tsx）。
+   * iso は錯視の視点ではないので null。**ストアの `matched`（A/B のみ）とは
+   * 別物** — C はここにだけ現れ、`ViewerState.matched` の型契約は破らない。
+   */
+  sweetSpot: AxisView | null
 }
 
 const ISO_DIRECTION: Vec3Like = normalized({ x: 1, y: 0.7, z: 1 })
 
 /**
- * スナップ視点の規約表。**side は +X**（−X に置くと B が鏡像になる —
- * ファイル冒頭のカメラ規約を参照）。front / side は完了時に正射影へ切り替え、
- * iso（俯瞰）は透視のまま。
+ * スナップ視点の規約表。**side は既定 90° で +X**（−X に置くと B が鏡像になる
+ * — ファイル冒頭のカメラ規約を参照）。front / side / top は完了時に正射影へ
+ * 切り替え、iso（俯瞰）は透視のまま。
+ *
+ * top（視点 C）は `input.c` が設定されているときだけ意味を持つが、スナップ
+ * 自体は常に到達可能にしてある（+Y から見ること自体は 2 視点でも無害）。
+ * UI 側（ui/Sidebar.tsx）が「視点 C が有効なときだけボタンを出す」形で
+ * 「主役でない」ことを示す。
  */
 export const SNAP_VIEWS: Record<SnapView, SnapViewSpec> = {
   front: { direction: { x: 0, y: 0, z: 1 }, projection: 'orthographic', sweetSpot: 'A' },
   side: { direction: { x: 1, y: 0, z: 0 }, projection: 'orthographic', sweetSpot: 'B' },
+  top: { direction: { x: 0, y: 1, z: 0 }, projection: 'orthographic', sweetSpot: 'C' },
   iso: { direction: ISO_DIRECTION, projection: 'perspective', sweetSpot: null },
+}
+
+/**
+ * スナップ先カメラ位置の単位ベクトル。**side は axisAngleDeg に応じた実際の
+ * 押し出し軸方向**（`viewpointCamera('B', axisAngleDeg).direction`）を返す —
+ * `SNAP_VIEWS.side.direction` は既定 90° の参照値でしかなく、そのまま使うと
+ * 斜交軸で「B のシルエットが成立しない角度」にスナップしてしまう
+ * （アンビギュアス・シリンダーの 45° がまさにこのケース）。
+ * front / top / iso は axisAngleDeg に依存しないため `SNAP_VIEWS` の値を
+ * そのまま返す。既定 90° では `SNAP_VIEWS.side.direction` と厳密に一致する。
+ */
+export function snapDirection(view: SnapView, axisAngleDeg: number = DEFAULT_AXIS_ANGLE_DEG): Vec3Like {
+  if (view === 'side') {
+    const { direction } = viewpointCamera('B', axisAngleDeg)
+    return { x: direction[0], y: direction[1], z: direction[2] }
+  }
+  return SNAP_VIEWS[view].direction
+}
+
+/**
+ * スナップ完了時のカメラ up ベクトル。**top（視点 C）だけ (0,0,−1)** —
+ * 真上から見下ろすとカメラ前方 (0,−1,0) が既定 up (0,1,0) と平行になり、
+ * カメラの姿勢計算（lookAt）が退化する。up を変えないと画面右が不定 /
+ * 反転する（ファイル冒頭のカメラ規約を参照）。front / side / iso は
+ * 従来どおり (0,1,0)。
+ */
+export function snapUp(view: SnapView): Vec3Like {
+  if (view === 'top') {
+    const { up } = viewpointCamera('C')
+    return { x: up[0], y: up[1], z: up[2] }
+  }
+  return { x: 0, y: 1, z: 0 }
 }
 
 const EPS = 1e-12
@@ -123,12 +209,21 @@ export function angleBetween(a: Vec3Like, b: Vec3Like): number {
 /**
  * カメラ前方ベクトルから合致中の Sweet Spot を返す（FR-021）。
  * 角度差が {@link SWEET_SPOT_THRESHOLD_RAD}（3.5°）**未満**で合致。
- * A と B は直交しているため同時合致はありえないが、関数としては
+ *
+ * B は `axisAngleDeg`（省略時は既定 90°）に応じた**実際の**前方
+ * （{@link viewForward}）と比較する — 固定 (−1,0,0) のまま判定すると、
+ * 斜交軸で「A↔B の真の角度差」とずれた誤判定になる（例：45° のとき
+ * A スナップ中でも B との角度差が 90° 相当に見えてしまい、B の
+ * シルエットが実際に成立する角度では逆に一切合致しなくなる）。
+ * 既定 90° では A・B は直交するため同時合致はありえないが、関数としては
  * 角度差の小さい方を選ぶ全域定義にしてある。
  */
-export function matchedSweetSpot(cameraForward: Vec3Like): SweetSpotView | null {
+export function matchedSweetSpot(
+  cameraForward: Vec3Like,
+  axisAngleDeg: number = DEFAULT_AXIS_ANGLE_DEG,
+): SweetSpotView | null {
   const angleA = angleBetween(cameraForward, VIEW_FORWARDS.A)
-  const angleB = angleBetween(cameraForward, VIEW_FORWARDS.B)
+  const angleB = angleBetween(cameraForward, viewForward('B', axisAngleDeg))
   const best: SweetSpotView = angleA <= angleB ? 'A' : 'B'
   const bestAngle = Math.min(angleA, angleB)
   return bestAngle < SWEET_SPOT_THRESHOLD_RAD ? best : null
@@ -234,8 +329,12 @@ export function perspectiveDistanceToMatchOrtho(
  * `useFrame` 内で毎フレーム ミューテートする。React の再レンダリングを
  * 起こさないので、インジケーターの数値表示はこれを rAF で読んで DOM を
  * 直接更新する（design.md「Sweet Spot 判定」）。初期値は π（不一致）。
+ *
+ * `c` は視点 C（top スナップ）専用。ui/SweetSpotIndicator.tsx は A/B しか
+ * 表示しないため配線しない（{@link LiveAngleSink} は 2 引数のまま） —
+ * CameraRig.tsx が top スナップからの離脱判定にだけ使う内部値。
  */
-export const sweetSpotLiveAngles = { a: Math.PI, b: Math.PI }
+export const sweetSpotLiveAngles = { a: Math.PI, b: Math.PI, c: Math.PI }
 
 /**
  * 連続表示の書き出し先（FR-021「カメラが動いている間、角度差をリアルタイムに
@@ -288,6 +387,10 @@ export interface SnapRequest {
  *   （actions 側でも同値を no-op にして二重にガード。NFR-002）
  * - `requestSnap`: UI（Task 5.2 のスナップボタン / Task 7.1 のキーボード）
  *   からの唯一の入口。CameraRig が購読して遷移を開始する（FR-022）
+ * - `curatedMode` / `rotationLocked`: 「常に回転できるとすぐにネタバラシに
+ *   なる」— カタログは演出されたカメラのシーケンス（A を見せる → B を鏡 /
+ *   スナップで見せる → 「仕組みを見る」で初めて自由回転を許す）であって、
+ *   自由なドラッグ探索ではない。詳細は CameraRig.tsx の冒頭コメントを参照。
  */
 export interface ViewerState {
   /** 現在合致中の Sweet Spot（FR-021）。UI のインジケーターが購読する */
@@ -296,18 +399,43 @@ export interface ViewerState {
   projection: ProjectionMode
   /** 未消費のスナップ要求。CameraRig が参照同一性の変化で検知する */
   snapRequest: SnapRequest | null
-  /** 視点スナップを要求する（front / side / iso）。連打も再発火する */
+  /**
+   * 「演出されたカメラ」文脈にいるか。true = カタログ（既定モード）を含む、
+   * 自由なドラッグ探索が錯視の驚きを台無しにする文脈。ui/Sidebar.tsx
+   * （自由モード）・ui/PuzzlePanel.tsx（クイズ）が**マウント／アンマウント**
+   * で追従させる（App.tsx / Gallery.tsx を編集せずにモード連動を実現する
+   * ための唯一の観測点 — 両ファイルはこのタスクの所有範囲外）。
+   * 既定 true（起動直後の既定モードはカタログ）。
+   */
+  curatedMode: boolean
+  /**
+   * OrbitControls のドラッグ回転を禁止するか。既定は `curatedMode` と同じ
+   * 値で始まるが、「仕組みを見る」ボタンで `curatedMode` を保ったまま
+   * 独立に外せる（CameraRig.tsx のオーバーレイ）。スナップ（requestSnap）は
+   * ロック中でも常に有効 — ロックが止めるのはユーザーのドラッグ入力だけで、
+   * プログラムによるカメラ遷移ではない。
+   */
+  rotationLocked: boolean
+  /** 視点スナップを要求する（front / side / top / iso）。連打も再発火する */
   requestSnap: (view: SnapView) => void
   /** 合致状態の書き込み。**同値なら no-op**（購読者へ通知しない） */
   setMatched: (view: SweetSpotView | null) => void
   /** 投影モードの書き込み。**同値なら no-op** */
   setProjection: (mode: ProjectionMode) => void
+  /** `curatedMode` の書き込み。Sidebar / PuzzlePanel のマウント境界専用 */
+  setCuratedMode: (curated: boolean) => void
+  /** `rotationLocked` の書き込み。CameraRig の「仕組みを見る」オーバーレイ専用 */
+  setRotationLocked: (locked: boolean) => void
 }
 
 export const useViewerStore = create<ViewerState>()((set, get) => ({
   matched: null,
   projection: 'perspective',
   snapRequest: null,
+  // 既定モードはカタログ（ui/modeStore.ts の INITIAL_MODE_STATE）なので、
+  // 起動直後は演出モード・ロック済みで始まる
+  curatedMode: true,
+  rotationLocked: true,
 
   requestSnap: (view) =>
     set((s) => ({ snapRequest: { view, seq: (s.snapRequest?.seq ?? 0) + 1 } })),
@@ -315,6 +443,16 @@ export const useViewerStore = create<ViewerState>()((set, get) => ({
   setMatched: (view) => {
     if (get().matched === view) return
     set({ matched: view })
+  },
+
+  setCuratedMode: (curated) => {
+    if (get().curatedMode === curated) return
+    set({ curatedMode: curated })
+  },
+
+  setRotationLocked: (locked) => {
+    if (get().rotationLocked === locked) return
+    set({ rotationLocked: locked })
   },
 
   setProjection: (mode) => {

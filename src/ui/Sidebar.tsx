@@ -23,12 +23,25 @@
  * 台座は両視点から見える位置に材料を足すため、**錯視を確実に壊す**。
  * これはトレードオフの明示が要件そのもの — チェックボックスのラベルと
  * 説明文で、有効化するその場所で開示する（印刷後に気付かせない）。
+ *
+ * ## 自由モードは「隠すものがない」— カメラの演出モードを解除する
+ * 「常に回転できるとすぐにネタバラシになる」が働くのはカタログ（既定モード）
+ * だけ — 自由モードは利用者自身が組み合わせを選ぶので、隠す「正解」が
+ * そもそもない。マウント時に `curatedMode` / `rotationLocked` を両方
+ * 解除し（scene/CameraRig.tsx が実際のロック解除を行う）、視点 A から
+ * 開くようにスナップを 1 回要求する。アンマウント時（カタログ／クイズへ
+ * 離脱）は `curatedMode` を戻す — App.tsx / Gallery.tsx を編集せずに
+ * モード連動を実現する唯一の観測点がこのマウント境界であるため
+ * （詳細は scene/CameraRig.tsx 冒頭のコメントを参照）。
  */
-import { useCallback, useId, useRef, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useId, useRef, useSyncExternalStore } from 'react'
 import type { BufferGeometry } from 'three'
 import {
+  DEFAULT_MIRROR_OFFSET,
   MAX_BASEPLATE_MM,
+  MAX_MIRROR_OFFSET,
   MIN_BASEPLATE_MM,
+  MIN_MIRROR_OFFSET,
   useStudioStore,
 } from '../store/useStudioStore'
 import {
@@ -39,6 +52,8 @@ import {
   type RealWorldSizeMm,
 } from '../studio/scale'
 import { WORKING_HEIGHT, type GeometryRef } from '../studio/useGenerationPipeline'
+import { DEFAULT_AXIS_ANGLE_DEG } from '../worker/protocol'
+import { useViewerStore, type SnapView } from '../scene/SweetSpot'
 import { AxisAngleControl } from './AxisAngleControl'
 import { ExportPanel } from './ExportPanel'
 import { NumberField } from './NumberField'
@@ -112,16 +127,37 @@ function useRealWorldSize(
   return useSyncExternalStore(subscribe, getSnapshot)
 }
 
-/** 視点スナップのボタン定義（FR-022）。`view` は scene/SweetSpot.ts の `SnapView` に対応 */
+/**
+ * 常設の視点スナップボタン（FR-022）。`view` は scene/SweetSpot.ts の
+ * `SnapView` に対応。**hint は関数**にしてある — 「側面 (B)」は既定 90°
+ * でだけ「+X から」が正しく、軸角（FR-102）が動くと実際のスナップ方向も
+ * 動くため、レンダー時に現在の軸角を渡して組み立てる（固定文言のままだと
+ * 90° 以外で単純に誤りになる）。「上面 (C)」（top）は視点 C が有効なときだけ
+ * 別枠で表示する（下記 render を参照。三方向変身立体は特例のため）。
+ */
 const SNAP_BUTTONS: ReadonlyArray<{
-  view: 'front' | 'side' | 'iso'
+  view: Exclude<SnapView, 'top'>
   label: string
-  hint: string
+  hint: (axisAngleDeg: number) => string
 }> = [
-  { view: 'front', label: '正面 (A)', hint: '+Z から正射影。シルエット A が成立する角度' },
-  { view: 'side', label: '側面 (B)', hint: '+X から正射影。シルエット B が成立する角度' },
-  { view: 'iso', label: '俯瞰', hint: '立体の全体像を見る角度' },
+  { view: 'front', label: '正面 (A)', hint: () => '+Z から正射影。シルエット A が成立する角度' },
+  {
+    view: 'side',
+    label: '側面 (B)',
+    hint: (axisAngleDeg) =>
+      axisAngleDeg === DEFAULT_AXIS_ANGLE_DEG
+        ? '+X から正射影。シルエット B が成立する角度'
+        : `軸角 ${axisAngleDeg}° の押し出し方向から正射影。シルエット B が成立する角度`,
+  },
+  { view: 'iso', label: '俯瞰', hint: () => '立体の全体像を見る角度' },
 ]
+
+/** 「上面 (C)」ボタン。視点 C が有効なときだけ render 側で追加表示する（FR-101） */
+const TOP_SNAP_BUTTON = {
+  view: 'top' as const,
+  label: '上面 (C)',
+  hint: '+Y から正射影。シルエット C が成立する角度',
+}
 
 export interface SidebarProps {
   /** FR-025: init-failed の再試行。`useGenerationPipeline()` の `retry` を渡す */
@@ -129,7 +165,7 @@ export interface SidebarProps {
   /** FR-006: 視点リセット。カメラ所有者（scene/ 側）が実装を注入する */
   onResetView?: () => void
   /** FR-022: 視点スナップ。scene/SweetSpot.ts の `requestSnap` を渡す */
-  onSnapView?: (view: 'front' | 'side' | 'iso') => void
+  onSnapView?: (view: SnapView) => void
   /** ADR-004 のジオメトリ参照。FR-029 の X / Y / Z 実寸表示に使う */
   geometryRef?: GeometryRef
   /** Sweet Spot 判定結果（scene/SweetSpot.ts）。未配線時は未計測表示 */
@@ -147,12 +183,36 @@ export function Sidebar({
   const baseId = useId()
   const options = useStudioStore((s) => s.options)
   const setVirtualMirror = useStudioStore((s) => s.setVirtualMirror)
+  const setMirrorOffset = useStudioStore((s) => s.setMirrorOffset)
   const setBaseplateEnabled = useStudioStore((s) => s.setBaseplateEnabled)
   const setBaseplateThicknessMm = useStudioStore((s) => s.setBaseplateThicknessMm)
   const setHeightMm = useStudioStore((s) => s.setHeightMm)
   const resetShapes = useStudioStore((s) => s.resetShapes)
+  // FR-102: side の hint を現在の軸角で組み立てる
+  const axisAngleDeg = useStudioStore((s) => s.input.axisAngleDeg)
+  // FR-101: 上面 (C) スナップは視点 C が有効なときだけ表示する
+  // （三方向変身立体は特例であり、既定の 2 視点では出さない — 他の
+  // 視点 C 関連 UI（AxisAngleControl・SilhouettePicker）と同じ方針）
+  const hasViewpointC = useStudioStore((s) => s.input.c !== null)
+
+  // 自由モードは演出モードの対象外（隠す「正解」がない）。マウント中だけ
+  // curatedMode / rotationLocked を解除し、離脱時（カタログ／クイズへの
+  // 切り替え）は curatedMode を戻す — カタログを再訪したときに再びロック
+  // された状態から始まるようにする（scene/CameraRig.tsx 冒頭のコメントを参照）。
+  // requestSnap は onSnapView（3D ビューポート接続後）に関わらず常に有効
+  // （scene/SweetSpot.ts の useViewerStore を直接使う、独立した経路のため）
+  useEffect(() => {
+    const store = useViewerStore.getState()
+    store.setCuratedMode(false)
+    store.setRotationLocked(false)
+    store.requestSnap('front')
+    return () => {
+      useViewerStore.getState().setCuratedMode(true)
+    }
+  }, [])
 
   const mirrorId = `${baseId}-mirror`
+  const mirrorOffsetId = `${baseId}-mirror-offset`
   const plateId = `${baseId}-plate`
   const plateDescId = `${baseId}-plate-desc`
   const thicknessId = `${baseId}-plate-thickness`
@@ -191,7 +251,17 @@ export function Sidebar({
           オプション
         </h2>
 
-        {/* 仮想ミラー（FR-024） */}
+        {/*
+          仮想ミラー（FR-024 / FR-102）。装飾ではなく、いくつかの錯視
+          （アンビギュアス・シリンダー、トランプマークの変身立体）の
+          成立機構そのもの — カタログでそれらの項目を選ぶと、この鏡は
+          ユーザーが触れずに自動で有効化・配置される（scene/VirtualMirror.tsx /
+          store/useStudioStore.ts の applyInput を参照）。ここで調整できるのは
+          有効・無効と「どれだけ離すか」（離隔）だけ。「どちらを向くか」
+          （向き）は視点 B の軸角から自動導出する錯視の成立条件そのものなので
+          調整項目にしない — 軸角コントロールと同じ「導出済みの既定へ戻せる」
+          パターンをここでも踏襲する。
+        */}
         <div className="flex flex-col gap-1">
           <label
             htmlFor={mirrorId}
@@ -208,7 +278,26 @@ export function Sidebar({
           </label>
           <p className="text-[11px] text-neutral-500">
             視点 B 側に鏡を置き、1 つの画面で両方のシルエットを同時に確認できます。
+            一部のカタログ項目（アンビギュアス・シリンダー等）では、この鏡自体が錯視の一部です。
           </p>
+          <NumberField
+            id={mirrorOffsetId}
+            label={`鏡の離隔（${MIN_MIRROR_OFFSET}〜${MAX_MIRROR_OFFSET}、既定 ${DEFAULT_MIRROR_OFFSET}）`}
+            value={options.mirrorOffset}
+            min={MIN_MIRROR_OFFSET}
+            max={MAX_MIRROR_OFFSET}
+            step={0.1}
+            disabled={!options.virtualMirror}
+            onCommit={setMirrorOffset}
+          />
+          <button
+            type="button"
+            onClick={() => setMirrorOffset(DEFAULT_MIRROR_OFFSET)}
+            disabled={!options.virtualMirror || options.mirrorOffset === DEFAULT_MIRROR_OFFSET}
+            className={BUTTON_CLASS}
+          >
+            鏡の離隔を既定に戻す
+          </button>
         </div>
 
         {/* 台座（FR-015）。錯視を壊すトレードオフを有効化の場で開示する */}
@@ -291,9 +380,11 @@ export function Sidebar({
         `requestSnap` を呼ぶだけ。錯視の「正解アングル」に一手で到達できることが
         この機能の目的なので、探索に迷った利用者の逃げ道でもある。
 
-        側面は必ず **+X** 側。−X に置くとシルエット B が左右反転する
-        （design.md「2.1 軸の割り当てとカメラ規約」）。方向の指定は
-        scene/SweetSpot.ts の SNAP_VIEWS が持つ。
+        側面は既定 90° のとき必ず **+X** 側（−X に置くとシルエット B が
+        左右反転する — design.md「2.1 軸の割り当てとカメラ規約」）。軸角
+        （FR-102）が既定から外れると実際のスナップ方向もそれに追従する —
+        方向の導出は scene/SweetSpot.ts の `snapDirection` が持つ。
+        上面（視点 C）は `input.c` が設定されているときだけ表示する。
       */}
       <section aria-labelledby={`${baseId}-snap-heading`} className="flex flex-col gap-1.5">
         <h2 id={`${baseId}-snap-heading`} className="text-xs font-semibold text-neutral-200">
@@ -306,12 +397,24 @@ export function Sidebar({
               type="button"
               onClick={() => onSnapView?.(view)}
               disabled={onSnapView === undefined}
-              title={hint}
+              title={hint(axisAngleDeg)}
               className={`${BUTTON_CLASS} flex-1`}
             >
               {label}
             </button>
           ))}
+          {hasViewpointC && (
+            <button
+              key={TOP_SNAP_BUTTON.view}
+              type="button"
+              onClick={() => onSnapView?.(TOP_SNAP_BUTTON.view)}
+              disabled={onSnapView === undefined}
+              title={TOP_SNAP_BUTTON.hint}
+              className={`${BUTTON_CLASS} flex-1`}
+            >
+              {TOP_SNAP_BUTTON.label}
+            </button>
+          )}
         </div>
         {onSnapView === undefined && (
           <p className="text-[10px] text-neutral-500">

@@ -14,21 +14,62 @@
  *   飛ぶため**完了後**に切り替え、`SweetSpot.ts` のサイズ一致計算で見かけの
  *   大きさを保つ。正射影中に視線が閾値（3.5°）を超えて逸れたら自由探索と
  *   みなして透視へ戻す（こちらもサイズ一致）
- * - **Sweet Spot 判定**（FR-021）。`useFrame` 内で毎フレーム角度差を計算し、
- *   store へは**判定値が変化したフレームのみ**書く（NFR-002 / ADR-004）。
- *   連続量は `sweetSpotLiveAngles` のミューテートのみで公開する
+ * - **Sweet Spot 判定**（FR-021 / FR-102）。`useFrame` 内で毎フレーム角度差を
+ *   計算し、store へは**判定値が変化したフレームのみ**書く（NFR-002 /
+ *   ADR-004）。連続量は `sweetSpotLiveAngles` のミューテートのみで公開する。
+ *   B の判定は `useStudioStore` の現在の `axisAngleDeg` を毎フレーム読んで
+ *   反映する（購読ではなく `getState()` — 値の変化では再レンダリングしない）
  *
- * ## 側面カメラは +X（design.md「2.1 軸の割り当てとカメラ規約」— 拘束）
+ * ## 側面カメラは軸角に従う（design.md「2.1 軸の割り当てとカメラ規約」の一般化）
  *
- * B の角柱は `rotate([0,90,0])` で局所 +X が world −Z に載る。+X カメラ
- * （up=+Y）の画面右は world −Z なので B は正立する。−X に置くと B だけ
- * 左右反転し、CSG 側の回帰テストでは検出できない。方向の定数は
- * `SweetSpot.ts` の `SNAP_VIEWS` / `VIEW_FORWARDS` に集約してある。
+ * B の角柱は `rotate([0, axisAngleDeg, 0])` で押し出され、局所 +X は world
+ * `(cos φ, 0, −sin φ)` に載る（φ = axisAngleDeg）。カメラは常に押し出し軸
+ * そのものの向き `(sin φ, 0, cos φ)` に置く — 既定 90° では従来どおり +X。
+ * 逆側に置くと B だけ左右反転し、CSG 側の回帰テストでは検出できない。
+ * 視点 C（top スナップ）は常に +Y・up=(0,0,−1) で軸角に依存しない。
+ * 方向の導出は `SweetSpot.ts` の `snapDirection` / `snapUp` / `viewForward`
+ * に集約してある（実体は `worker/protocol.ts` の `viewpointCamera`）。
+ *
+ * ## カメラは演出されたシーケンス、常時自由回転ではない
+ *
+ * 「常に回転できるとすぐにネタバラシになる」— 自由にドラッグできると、
+ * 最初に見えるのは錯視の「正解」ではなく、いびつな立体そのもの（種明かし）
+ * になってしまう。カタログ（既定モード）は次の順序を強制する：
+ *
+ * 1. 選んだ瞬間に視点 A へスナップする（`useStudioStore` の
+ *    `generationEpoch` を購読し、`curatedMode` 中の入力変更で
+ *    `requestSnap('front')` を自動発行する）
+ * 2. 視点 B は鏡（有効なら）かスナップで見せる —自由回転はまだ許さない
+ * 3. 「仕組みを見る」で初めて自由回転（`rotationLocked` を外す）を許可する。
+ *    戻るボタン（「錯視に戻る」）で視点 A ＋ロックへ一手で戻れる
+ *
+ * `rotationLocked` は `useViewerStore` の状態（scene/SweetSpot.ts）。
+ * ロックは **OrbitControls を実際に `enabled = false` にする**（イベントを
+ * 握りつぶすだけではない）。ロック・アンロックの境界は `flushInertia` を
+ * 通す — 直前のドラッグ慣性を凍結したまま次の状態に持ち込むと、
+ * 再度 `update()` したときにカメラが弾き飛ばされる事故になる
+ * （既存のスナップ開始時と同じ理由）。ロック中でも `requestSnap` 経由の
+ * プログラム的な遷移（スナップ・仕組みを見る時の視点復帰）は常に効く —
+ * ロックが止めるのはユーザーのポインタ入力だけ。
+ *
+ * `curatedMode`（「演出モードにいるか」）は App.tsx / Gallery.tsx を編集
+ * せずにモード連動を実現するための設計 — このタスクの所有範囲外の 2
+ * ファイルに手を入れず、ui/Sidebar.tsx（自由モード）と ui/PuzzlePanel.tsx
+ * （クイズ）の**マウント／アンマウント**を唯一の観測点にする。どちらも
+ * マウント時に `curatedMode: false` ・アンマウント時に `curatedMode: true`
+ * を書き戻すので、カタログ（どちらもマウントしないモード）は自動的に
+ * 演出モードのままになる。自由モード・クイズは「隠すものがない」
+ * （自由モード）・「調べることそのものがパズル」（クイズ）という理由で
+ * 両方ともマウント時に `rotationLocked: false` にする —
+ * クイズの A/B スナップ封鎖は PuzzlePanel.tsx 側（スナップ UI を出さない）
+ * で既に達成済みで、ここでの二重対応は不要（ロックは自由回転だけを扱う）。
  */
 import { useCallback, useEffect, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
+import { Html } from '@react-three/drei'
 import { OrthographicCamera, PerspectiveCamera, Vector3 } from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { useStudioStore } from '../store/useStudioStore'
 import {
   angleBetween,
   easeInOutCubic,
@@ -36,15 +77,22 @@ import {
   orthoZoomToMatchPerspective,
   perspectiveDistanceToMatchOrtho,
   slerpDirection,
+  snapDirection,
+  snapUp,
   SNAP_VIEWS,
   SWEET_SPOT_THRESHOLD_RAD,
   sweetSpotLiveAngles,
   useViewerStore,
+  viewForward,
   VIEW_FORWARDS,
   type SnapView,
   type SweetSpotView,
   type Vec3Like,
 } from './SweetSpot'
+
+/** サイドバーのボタンと揃えた見た目（44px 以上のタップ領域 + 可視フォーカス） */
+const OVERLAY_BUTTON_CLASS =
+  'min-h-11 rounded border border-neutral-600 bg-neutral-900/90 px-3 text-xs text-neutral-200 hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400'
 
 /** スナップ遷移の所要時間（FR-022: 400ms 以内） */
 const SNAP_DURATION_SEC = 0.4
@@ -62,6 +110,13 @@ interface ActiveTween {
   view: SnapView
   fromDir: Vec3Like
   toDir: Vec3Like
+  /**
+   * 遷移先の up ベクトル（`snapUp(view)`）。遷移開始時に確定し、tween 中は
+   * 一定に保つ。top（視点 C）だけ (0,0,−1) — 遷移の最終フレームで direction
+   * が (0,1,0) に達したとき up が (0,1,0) のままだと lookAt が退化するため、
+   * 遷移全体であらかじめ正しい up を使う（SweetSpot.ts の `snapUp` を参照）
+   */
+  toUp: Vec3Like
   fromTarget: Vector3
   radius: number
   /** 最初のフレームで clock から充填する（マウント直後のジャンプ防止） */
@@ -106,15 +161,33 @@ function flushInertia(controls: OrbitControls): void {
 }
 
 /**
- * カメラリグ本体。`<Viewport>` の Canvas 直下に 1 つだけ置く。
- * 何も描画しない（null を返す）が、OrbitControls・スナップ遷移・投影切替・
- * Sweet Spot 判定のすべてを所有する。
+ * `useViewerStore` の `rotationLocked` を `controls.enabled` へ反映する。
+ * **tween の実行中は呼ばないこと** — tween は自前で `controls.enabled = false`
+ * を管理する（プログラム的な遷移とユーザードラッグの取り合いを防ぐため）。
+ * ロックは「自由なドラッグ探索を禁止する」ことが目的で、`requestSnap` 経由の
+ * 遷移はロック中でも常に効く（この関数が呼ばれるのは遷移の**外側**でだけ）。
  */
-export function CameraRig(): null {
+function applyRotationLock(controls: OrbitControls): void {
+  controls.enabled = !useViewerStore.getState().rotationLocked
+}
+
+/**
+ * カメラリグ本体。`<Viewport>` の Canvas 直下に 1 つだけ置く。
+ * OrbitControls・スナップ遷移・投影切替・Sweet Spot 判定のすべてを所有する。
+ * 描画するのは「仕組みを見る／錯視に戻る」オーバーレイ（drei `Html`）だけ —
+ * `curatedMode` のときだけ表示する、ビューポート右下の小さな操作群。
+ * `curatedMode` / `rotationLocked` の読み出しは購読（`useViewerStore`）で
+ * 行う — この 2 値は離散的なモード・ボタン操作でしか変わらないため、
+ * 変化時の再レンダリングは NFR-002（毎フレームの再レンダリング回避）に
+ * 抵触しない（抵触するのは連続量である角度差の類だけ）。
+ */
+export function CameraRig() {
   const gl = useThree((s) => s.gl)
   const get = useThree((s) => s.get)
   const set = useThree((s) => s.set)
   const size = useThree((s) => s.size)
+  const curatedMode = useViewerStore((s) => s.curatedMode)
+  const rotationLocked = useViewerStore((s) => s.rotationLocked)
 
   const controlsRef = useRef<OrbitControls | null>(null)
   /** Canvas が作った既定の透視カメラ（自由探索用）。マウント時に捕捉する */
@@ -195,7 +268,8 @@ export function CameraRig(): null {
       ortho.top = ORTHO_HALF_HEIGHT
       ortho.bottom = -ORTHO_HALF_HEIGHT
       ortho.position.copy(persp.position)
-      ortho.up.set(0, 1, 0)
+      const up = snapUp(view)
+      ortho.up.set(up.x, up.y, up.z)
       ortho.updateProjectionMatrix()
       ortho.lookAt(controls.target)
       controls.object = ortho
@@ -207,7 +281,7 @@ export function CameraRig(): null {
     [get, set],
   )
 
-  /** スナップ遷移の終端処理。front / side のみ正射影へ切り替える */
+  /** スナップ遷移の終端処理。front / side / top のみ正射影へ切り替える */
   const finalizeSnap = useCallback(
     (view: SnapView): void => {
       if (SNAP_VIEWS[view].projection === 'orthographic') {
@@ -238,7 +312,12 @@ export function CameraRig(): null {
         : (current as PerspectiveCamera)
       if (camera === null || !camera.isPerspectiveCamera) return
 
-      const spec = SNAP_VIEWS[view]
+      // FR-102: side の実際のスナップ方向は現在の軸角に従う（既定 90° は
+      // 従来どおり +X）。read はここだけ — 購読しないので軸角変更それ自体は
+      // 再レンダリングを起こさない
+      const axisAngleDeg = useStudioStore.getState().input.axisAngleDeg
+      const targetDirection = snapDirection(view, axisAngleDeg)
+      const targetUp = snapUp(view)
       const radius = clamp(
         camera.position.distanceTo(ORIGIN),
         MIN_SNAP_RADIUS,
@@ -249,12 +328,12 @@ export function CameraRig(): null {
         // FR-027: 遷移アニメーションを行わず即時切替
         tweenRef.current = null
         camera.position
-          .set(spec.direction.x, spec.direction.y, spec.direction.z)
+          .set(targetDirection.x, targetDirection.y, targetDirection.z)
           .multiplyScalar(radius)
         controls.target.set(0, 0, 0)
-        camera.up.set(0, 1, 0)
+        camera.up.set(targetUp.x, targetUp.y, targetUp.z)
         camera.lookAt(ORIGIN)
-        controls.enabled = true
+        applyRotationLock(controls)
         controls.update()
         finalizeSnap(view)
         return
@@ -268,7 +347,8 @@ export function CameraRig(): null {
       tweenRef.current = {
         view,
         fromDir,
-        toDir: spec.direction,
+        toDir: targetDirection,
+        toUp: targetUp,
         fromTarget: controls.target.clone(),
         radius,
         start: null,
@@ -296,6 +376,10 @@ export function CameraRig(): null {
     controls.maxZoom = 40
     controls.target.set(0, 0, 0)
     controls.update()
+    // 既定モード（カタログ）は curatedMode / rotationLocked ともに true で
+    // 始まる（SweetSpot.ts の初期値）。マウント直後の 1 フレーム目から
+    // ドラッグを禁止するため、ここで初期状態を反映する
+    applyRotationLock(controls)
     const onStart = (): void => {
       draggingRef.current = true
     }
@@ -345,9 +429,49 @@ export function CameraRig(): null {
     [beginSnap],
   )
 
+  // rotationLocked の購読。tween 実行中の付け外しと衝突しないよう、
+  // tween が動いていないときだけ controls.enabled に反映する（tween 完了時の
+  // 反映は useFrame 側の finalizeSnap 直前で行う。ここは「tween 外での
+  // ロック切り替え」— 仕組みを見る／錯視に戻るボタン専用の経路）
+  useEffect(
+    () =>
+      useViewerStore.subscribe((state, prev) => {
+        if (state.rotationLocked === prev.rotationLocked) return
+        const controls = controlsRef.current
+        if (controls === null) return
+        // ロック境界を跨ぐ前に残留慣性を確定させる（スナップ開始時と同じ理由 —
+        // 凍結したデルタを次の update() まで持ち越すとカメラが弾き飛ばされる）
+        flushInertia(controls)
+        if (tweenRef.current === null) applyRotationLock(controls)
+      }),
+    [],
+  )
+
+  // カタログ選択の自動演出（FR: 「常に回転できるとすぐにネタバラシになる」）。
+  // curatedMode 中の入力変更（= カタログ項目の選択。Gallery.tsx は
+  // applyInput(entry.preset) を 1 トランザクションで呼ぶので、生成世代が
+  // ちょうど 1 回進む）を検知して、視点 A への着地とロックの再確定を行う。
+  // 自由モード（Sidebar.tsx）はここを経由せず個別セッターを呼ぶため
+  // generationEpoch を進めず、クイズ（PuzzlePanel.tsx）は curatedMode を
+  // 自ら false にしているのでこの分岐に入らない
+  useEffect(
+    () =>
+      useStudioStore.subscribe((state, prev) => {
+        if (state.generationEpoch === prev.generationEpoch) return
+        if (!useViewerStore.getState().curatedMode) return
+        useViewerStore.getState().setRotationLocked(true)
+        beginSnap('front')
+      }),
+    [beginSnap],
+  )
+
   useFrame((state) => {
     const controls = controlsRef.current
     if (controls === null) return
+
+    // FR-102: 現在の軸角。購読ではなく getState() で読むので、値の変化は
+    // このフレームの計算に反映されるだけで React 再レンダリングは起きない
+    const axisAngleDeg = useStudioStore.getState().input.axisAngleDeg
 
     // --- 1. スナップ遷移 or 通常の減衰更新 ---
     const tween = tweenRef.current
@@ -363,11 +487,11 @@ export function CameraRig(): null {
         dir.z * tween.radius,
       )
       controls.target.lerpVectors(tween.fromTarget, ORIGIN, k)
-      camera.up.set(0, 1, 0)
+      camera.up.set(tween.toUp.x, tween.toUp.y, tween.toUp.z)
       camera.lookAt(controls.target)
       if (t >= 1) {
         tweenRef.current = null
-        controls.enabled = true
+        applyRotationLock(controls)
         controls.update()
         finalizeSnap(tween.view)
       }
@@ -376,11 +500,13 @@ export function CameraRig(): null {
     }
 
     // --- 2. Sweet Spot 角度（毎フレーム計算、公開はミューテートのみ） ---
-    // finalizeSnap でカメラが切り替わった可能性があるため読み直す
+    // finalizeSnap でカメラが切り替わった可能性があるため読み直す。
+    // B は現在の axisAngleDeg に応じた実際の前方と比較する（FR-102）
     const activeCamera = get().camera
     activeCamera.getWorldDirection(TMP_FORWARD)
     sweetSpotLiveAngles.a = angleBetween(TMP_FORWARD, VIEW_FORWARDS.A)
-    sweetSpotLiveAngles.b = angleBetween(TMP_FORWARD, VIEW_FORWARDS.B)
+    sweetSpotLiveAngles.b = angleBetween(TMP_FORWARD, viewForward('B', axisAngleDeg))
+    sweetSpotLiveAngles.c = angleBetween(TMP_FORWARD, VIEW_FORWARDS.C)
 
     // --- 3. 正射影からの離脱判定 ---
     // スナップ視点から 3.5° を超えて逸れたら自由探索へ（透視に戻す）。
@@ -394,19 +520,78 @@ export function CameraRig(): null {
       !draggingRef.current
     ) {
       const sweet = SNAP_VIEWS[snapped].sweetSpot
-      const angle = sweet === 'A' ? sweetSpotLiveAngles.a : sweetSpotLiveAngles.b
+      const angle =
+        sweet === 'A'
+          ? sweetSpotLiveAngles.a
+          : sweet === 'B'
+            ? sweetSpotLiveAngles.b
+            : sweetSpotLiveAngles.c
       if (sweet !== null && angle > SWEET_SPOT_THRESHOLD_RAD) {
         switchToPerspective()
       }
     }
 
     // --- 4. 合致判定の store 書き込み（変化したフレームのみ。NFR-002） ---
-    const matched = matchedSweetSpot(TMP_FORWARD)
+    const matched = matchedSweetSpot(TMP_FORWARD, axisAngleDeg)
     if (matched !== lastMatchedRef.current) {
       lastMatchedRef.current = matched
       useViewerStore.getState().setMatched(matched)
     }
   })
 
-  return null
+  /** 「仕組みを見る」。curatedMode は保ったまま自由回転だけを解く */
+  const handleReveal = useCallback((): void => {
+    useViewerStore.getState().setRotationLocked(false)
+  }, [])
+
+  /** 「錯視に戻る」。ロックを戻し、視点 A へスナップし直す（一手で戻す） */
+  const handleReturnToIllusion = useCallback((): void => {
+    useViewerStore.getState().setRotationLocked(true)
+    beginSnap('front')
+  }, [beginSnap])
+
+  if (!curatedMode) return null
+
+  return (
+    <Html fullscreen style={{ pointerEvents: 'none' }}>
+      {/*
+        カタログ（演出モード）専用のオーバーレイ。ビューポート右下、
+        サイドバーのボタンと同じ見た目（44px タップ領域 + フォーカスリング）。
+        ロック中は A / B スナップ ＋「仕組みを見る」、解除後は「錯視に戻る」
+        だけを出す — 「戻る手段」を常に 1 手で提供する。
+      */}
+      <div
+        className="absolute right-3 bottom-3 flex gap-1.5"
+        style={{ pointerEvents: 'auto' }}
+      >
+        {rotationLocked ? (
+          <>
+            <button
+              type="button"
+              onClick={() => useViewerStore.getState().requestSnap('front')}
+              title="+Z から正射影。シルエット A が成立する角度"
+              className={OVERLAY_BUTTON_CLASS}
+            >
+              正面 (A)
+            </button>
+            <button
+              type="button"
+              onClick={() => useViewerStore.getState().requestSnap('side')}
+              title="視点 B の軸方向から正射影。シルエット B が成立する角度"
+              className={OVERLAY_BUTTON_CLASS}
+            >
+              側面 (B)
+            </button>
+            <button type="button" onClick={handleReveal} className={OVERLAY_BUTTON_CLASS}>
+              仕組みを見る
+            </button>
+          </>
+        ) : (
+          <button type="button" onClick={handleReturnToIllusion} className={OVERLAY_BUTTON_CLASS}>
+            錯視に戻る
+          </button>
+        )}
+      </div>
+    </Html>
+  )
 }

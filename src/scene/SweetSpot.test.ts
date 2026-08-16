@@ -1,16 +1,22 @@
 /**
- * SweetSpot.ts の単体テスト（Task 5.4）。Node の Vitest のみで動く —
- * DOM・canvas・three を必要としない（純関数と store だけを検証する）。
+ * SweetSpot.ts の単体テスト（Task 5.4 / FR-102 の追加検証）。Node の Vitest
+ * のみで動く — DOM・canvas・three を必要としない（純関数と store だけを検証する）。
  *
  * 特に固定する仕様：
  * - 閾値 3.5°（≈ 0.0611 rad）と「未満で合致」の境界（FR-021）
- * - **側面カメラは +X**（design.md「2.1 軸の割り当てとカメラ規約」）。
+ * - **側面カメラは既定 90° で +X**（design.md「2.1 軸の割り当てとカメラ規約」）。
  *   −X 前方（= −X カメラ相当ではなく「+X に向く前方」）が合致し、
  *   +X 前方（−X 側にカメラを置いた状態）は合致**しない**こと —
  *   CSG 側の回転回帰テストでは検出できない鏡像事故をここで塞ぐ
+ * - **B は axisAngleDeg に追従する**（FR-102）。斜交軸（例：45°）でも
+ *   `viewForward('B', axisAngleDeg)` / `snapDirection('side', axisAngleDeg)` /
+ *   `matchedSweetSpot(forward, axisAngleDeg)` が実際の B 軸と整合すること、
+ *   既定 90° では `Math.cos(π/2)` の丸め誤差を混入させず厳密値のままなこと
+ * - 視点 C（top スナップ）の up は (0,0,−1)（既定 (0,1,0) だと退化する）
  * - store の書き込みが**値の変化時のみ**購読者へ通知されること（NFR-002）
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { DEFAULT_AXIS_ANGLE_DEG } from '../worker/protocol'
 import {
   angleBetween,
   clearLiveAngleSink,
@@ -22,10 +28,13 @@ import {
   publishLiveAngles,
   setLiveAngleSink,
   slerpDirection,
+  snapDirection,
+  snapUp,
   SNAP_VIEWS,
   SWEET_SPOT_THRESHOLD_RAD,
   sweetSpotLiveAngles,
   useViewerStore,
+  viewForward,
   VIEW_FORWARDS,
   type Vec3Like,
 } from './SweetSpot'
@@ -80,29 +89,108 @@ describe('閾値と視点規約（FR-021 / design.md 2.1）', () => {
     expect(SWEET_SPOT_THRESHOLD_RAD).toBeCloseTo(0.0611, 4)
   })
 
-  it('視点 A の前方は (0,0,−1)、視点 B の前方は (−1,0,0)', () => {
+  it('既定軸角：視点 A の前方は (0,0,−1)、視点 B の前方は (−1,0,0)、視点 C の前方は (0,−1,0)', () => {
     expect(VIEW_FORWARDS.A).toEqual({ x: 0, y: 0, z: -1 })
     expect(VIEW_FORWARDS.B).toEqual({ x: -1, y: 0, z: 0 })
+    expect(VIEW_FORWARDS.C).toEqual({ x: 0, y: -1, z: 0 })
   })
 
-  it('スナップ規約：front は +Z、side は **+X**、iso は透視のまま', () => {
+  it('スナップ規約：front は +Z、side は既定 **+X**、top は +Y、iso は透視のまま', () => {
     expect(SNAP_VIEWS.front.direction).toEqual({ x: 0, y: 0, z: 1 })
     // side を −X にすると B が左右反転する（鏡像事故）。ここで +X を固定する
     expect(SNAP_VIEWS.side.direction).toEqual({ x: 1, y: 0, z: 0 })
+    expect(SNAP_VIEWS.top.direction).toEqual({ x: 0, y: 1, z: 0 })
     expect(SNAP_VIEWS.front.projection).toBe('orthographic')
     expect(SNAP_VIEWS.side.projection).toBe('orthographic')
+    expect(SNAP_VIEWS.top.projection).toBe('orthographic')
     expect(SNAP_VIEWS.iso.projection).toBe('perspective')
     expect(SNAP_VIEWS.front.sweetSpot).toBe('A')
     expect(SNAP_VIEWS.side.sweetSpot).toBe('B')
+    expect(SNAP_VIEWS.top.sweetSpot).toBe('C')
     expect(SNAP_VIEWS.iso.sweetSpot).toBeNull()
   })
 
-  it('スナップ方向は単位ベクトルで、A/B の前方はスナップ方向の逆向き', () => {
+  it('スナップ方向は単位ベクトルで、A/B/C の前方はスナップ方向の逆向き', () => {
     for (const spec of Object.values(SNAP_VIEWS)) {
       expect(length(spec.direction)).toBeCloseTo(1, 12)
     }
     expect(VIEW_FORWARDS.A.z).toBe(-SNAP_VIEWS.front.direction.z)
     expect(VIEW_FORWARDS.B.x).toBe(-SNAP_VIEWS.side.direction.x)
+    expect(VIEW_FORWARDS.C.y).toBe(-SNAP_VIEWS.top.direction.y)
+  })
+})
+
+describe('FR-102: B は axisAngleDeg に追従する（軸角スナップ・鏡・Sweet Spot の共通基盤）', () => {
+  it('既定 90° では viewForward(\'B\', 90) が厳密に (−1,0,0)（丸め誤差なし）', () => {
+    // Math.cos(π/2) は 6.1e-17 であって 0 ではない。orthogonal 特別扱いで
+    // 厳密値を保つ（worker/protocol.ts の viewpointCamera と同じ契約）
+    const forward = viewForward('B', DEFAULT_AXIS_ANGLE_DEG)
+    expect(forward).toEqual({ x: -1, y: 0, z: 0 })
+    expect(forward).toEqual(VIEW_FORWARDS.B)
+  })
+
+  it('45°（アンビギュアス・シリンダー）では前方が (−sin45°,0,−cos45°) になる', () => {
+    const forward = viewForward('B', 45)
+    expect(forward.x).toBeCloseTo(-Math.SQRT1_2, 12)
+    expect(forward.y).toBe(0)
+    expect(forward.z).toBeCloseTo(-Math.SQRT1_2, 12)
+  })
+
+  it('snapDirection(\'side\', …) は既定 90° で厳密に (1,0,0)、45° では (sin45°,0,cos45°)', () => {
+    expect(snapDirection('side', DEFAULT_AXIS_ANGLE_DEG)).toEqual({ x: 1, y: 0, z: 0 })
+    expect(snapDirection('side')).toEqual({ x: 1, y: 0, z: 0 }) // 省略時も既定 90°
+    const dir45 = snapDirection('side', 45)
+    expect(dir45.x).toBeCloseTo(Math.SQRT1_2, 12)
+    expect(dir45.y).toBe(0)
+    expect(dir45.z).toBeCloseTo(Math.SQRT1_2, 12)
+  })
+
+  it('snapDirection は front / top / iso では axisAngleDeg に依存しない', () => {
+    expect(snapDirection('front', 45)).toEqual(SNAP_VIEWS.front.direction)
+    expect(snapDirection('top', 45)).toEqual(SNAP_VIEWS.top.direction)
+    expect(snapDirection('iso', 45)).toEqual(SNAP_VIEWS.iso.direction)
+  })
+
+  it('matchedSweetSpot は axisAngleDeg を反映する — 45° では A スナップ中の A↔B 角度差が 45°', () => {
+    // 45° 軸角で A スナップ（前方 (0,0,-1)）にいるとき、B との角度差は
+    // 45°（viewForward('B',45) との angleBetween）であり、90° 相当には
+    // ならない。3.5° 閾値の内側に入らないので B には合致しない
+    const aForward = { x: 0, y: 0, z: -1 }
+    expect(matchedSweetSpot(aForward, 45)).toBe('A')
+    expect(angleBetween(aForward, viewForward('B', 45))).toBeCloseTo(rad(45), 10)
+
+    // 実際の B 前方（45°）を向けば、45° 軸角の下では B に合致する
+    const bForward45 = viewForward('B', 45)
+    expect(matchedSweetSpot(bForward45, 45)).toBe('B')
+    // 一方、固定 90° 判定（axisAngleDeg 省略）では合致しない
+    // （実際の B 軸が (-1,0,0) から 45° ずれているため）
+    expect(matchedSweetSpot(bForward45)).toBeNull()
+  })
+
+  it('省略時（axisAngleDeg なし）は既定 90° として振る舞う（既存呼び出しの後方互換）', () => {
+    expect(matchedSweetSpot({ x: -1, y: 0, z: 0 })).toBe('B')
+    expect(matchedSweetSpot({ x: -1, y: 0, z: 0 }, DEFAULT_AXIS_ANGLE_DEG)).toBe('B')
+  })
+})
+
+describe('視点 C（top スナップ）の up ベクトル', () => {
+  it('top だけ up が (0,0,−1)。他は (0,1,0)', () => {
+    expect(snapUp('top')).toEqual({ x: 0, y: 0, z: -1 })
+    expect(snapUp('front')).toEqual({ x: 0, y: 1, z: 0 })
+    expect(snapUp('side')).toEqual({ x: 0, y: 1, z: 0 })
+    expect(snapUp('iso')).toEqual({ x: 0, y: 1, z: 0 })
+  })
+
+  it('top の up は前方 (0,−1,0) と平行ではない（lookAt が退化しない）', () => {
+    const up = snapUp('top')
+    const forward = VIEW_FORWARDS.C
+    // 平行なら外積の長さが 0 になる。ここではゼロでないことだけ確認する
+    const cross = {
+      x: up.y * forward.z - up.z * forward.y,
+      y: up.z * forward.x - up.x * forward.z,
+      z: up.x * forward.y - up.y * forward.x,
+    }
+    expect(length(cross)).toBeGreaterThan(0.9)
   })
 })
 
@@ -225,6 +313,88 @@ describe('投影切替のサイズ一致（FR-023）', () => {
     const near = perspectiveDistanceToMatchOrtho(1, 50, 4)
     const far = perspectiveDistanceToMatchOrtho(1, 50, 0.5)
     expect(near).toBeLessThan(far)
+  })
+})
+
+/**
+ * 初期スナップのカメラ数学が縮退しないこと（回帰テスト）。
+ *
+ * カタログ既定モードはマウント直後に視点 A（front）へ自動スナップし、
+ * side / top も同じ経路（CameraRig.tsx の `switchToOrthographic`）を通る。
+ * この経路は `orthoZoomToMatchPerspective` で **距離が分母** のズームを
+ * 計算するため、距離が 0 に近い/非有限だとズームが 0・負・Infinity・NaN に
+ * 縮退し、正射影の可視範囲が消えて画面が真っ黒になる（キャンバス全体が
+ * 黒くなる系の不具合はテストの exit code には出ない — 実ブラウザで
+ * `readPixels` して初めて見える。このテストは少なくとも「入力する値」の
+ * 側は縮退していないことを固定する）。
+ *
+ * `Viewport.tsx` の実際の設定値（fov 40 / 初期半径 5）と
+ * `CameraRig.tsx` の `MIN_SNAP_RADIUS`(2) 〜 `MAX_SNAP_RADIUS`(30) の
+ * クランプ範囲を使う — この 2 ファイルは値をエクスポートしていないため、
+ * ここでは値を複製する（ずれたらこのコメントとあわせて更新すること）。
+ */
+describe('初期スナップのカメラ数学は縮退しない（regression: 真っ黒なキャンバス）', () => {
+  const ORTHO_HALF_HEIGHT = 1
+  const FOV_DEG = 40 // Viewport.tsx の CAMERA_PROPS.fov
+  const MIN_SNAP_RADIUS = 2 // CameraRig.tsx
+  const MAX_SNAP_RADIUS = 30 // CameraRig.tsx
+  const INITIAL_RADIUS = 5 // Viewport.tsx
+
+  const curatedViews = ['front', 'side', 'top'] as const
+
+  it.each(curatedViews)(
+    '視点 %s: スナップ方向 / up は有限かつ互いに平行でない（lookAt が縮退しない）',
+    (view) => {
+      const direction = snapDirection(view, DEFAULT_AXIS_ANGLE_DEG)
+      const up = snapUp(view)
+
+      for (const v of [direction, up]) {
+        expect(Number.isFinite(v.x)).toBe(true)
+        expect(Number.isFinite(v.y)).toBe(true)
+        expect(Number.isFinite(v.z)).toBe(true)
+      }
+
+      // up と方向が平行（cross ≈ 0）だと lookAt の基底が崩れる。
+      // 視点 C（top）は前方が (0,±1,0) なので既定 up (0,1,0) が平行になる —
+      // ここを (0,0,-1) にすることで非退化にしているのが snapUp の役目
+      const cross = {
+        x: up.y * direction.z - up.z * direction.y,
+        y: up.z * direction.x - up.x * direction.z,
+        z: up.x * direction.y - up.y * direction.x,
+      }
+      expect(length(cross)).toBeGreaterThan(0.5)
+    },
+  )
+
+  it.each(curatedViews)(
+    '視点 %s: MIN〜MAX スナップ半径のどこでも ortho zoom は有限かつ正',
+    (view) => {
+      // switchToOrthographic は SNAP_VIEWS[view].projection が
+      // 'orthographic' の視点でだけ呼ばれる。ここでは 3 つの curated 視点
+      // すべてがそうであることも合わせて確認する
+      expect(SNAP_VIEWS[view].projection).toBe('orthographic')
+
+      for (const distance of [MIN_SNAP_RADIUS, INITIAL_RADIUS, MAX_SNAP_RADIUS]) {
+        const zoom = orthoZoomToMatchPerspective(ORTHO_HALF_HEIGHT, FOV_DEG, distance)
+        expect(Number.isFinite(zoom)).toBe(true)
+        expect(zoom).toBeGreaterThan(0)
+      }
+    },
+  )
+
+  it('distance が 0（ガードなし）だと ortho zoom は Infinity に縮退する — だから CameraRig は Math.max(distance, 1e-3) でガードする', () => {
+    // orthoZoomToMatchPerspective 自体は分母が 0 のとき Infinity を返す
+    // （NaN ではないので Number.isFinite で確実に弾ける）。
+    // switchToOrthographic（CameraRig.tsx）が
+    // `Math.max(persp.position.distanceTo(controls.target), 1e-3)` で
+    // 距離をガードしているのは、まさにこの入力を通さないため
+    const unguardedZoom = orthoZoomToMatchPerspective(ORTHO_HALF_HEIGHT, FOV_DEG, 0)
+    expect(Number.isFinite(unguardedZoom)).toBe(false)
+
+    const guardedDistance = Math.max(0, 1e-3)
+    const guardedZoom = orthoZoomToMatchPerspective(ORTHO_HALF_HEIGHT, FOV_DEG, guardedDistance)
+    expect(Number.isFinite(guardedZoom)).toBe(true)
+    expect(guardedZoom).toBeGreaterThan(0)
   })
 })
 
