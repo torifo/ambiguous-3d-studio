@@ -12,7 +12,7 @@ import {
   type GenerationSummary,
   type StudioState,
 } from './useStudioStore'
-import type { SilhouetteSource } from '../geometry/types'
+import type { PreflightWarning, SilhouetteSource } from '../geometry/types'
 
 const star: SilhouetteSource = { kind: 'preset', id: 'star' }
 const heart: SilhouetteSource = { kind: 'preset', id: 'heart' }
@@ -29,11 +29,27 @@ const summary: GenerationSummary = {
   elapsedMs: 180,
 }
 
+const emptyBandWarning: PreflightWarning = {
+  code: 'EMPTY_BAND',
+  certainty: 'exact',
+  message: 'この高さで立体が途切れます',
+  band: [0.4, 0.6],
+}
+
 let store: StoreApi<StudioState>
 
 beforeEach(() => {
   store = createStudioStore()
 })
+
+/** ready まで進めて 1 回生成を成功させる（パイプラインの正常系を再現） */
+function generateSuccessfully(s: StoreApi<StudioState>): number {
+  const epoch = s.getState().startGenerating()
+  expect(epoch).not.toBeNull()
+  s.getState().generationSucceeded(epoch!, summary)
+  expect(s.getState().status).toBe('success')
+  return epoch!
+}
 
 describe('初期状態', () => {
   it('loading-wasm で始まり、入力は正方形 × 円', () => {
@@ -51,11 +67,12 @@ describe('初期状態', () => {
     expect(options.heightMm).toBe(60)
   })
 
-  it('警告・エラー・結果は空', () => {
+  it('警告・エラー・結果は空、世代は 0', () => {
     const s = store.getState()
     expect(s.warnings).toEqual([])
     expect(s.lastError).toBeNull()
     expect(s.lastResult).toBeNull()
+    expect(s.generationEpoch).toBe(0)
   })
 })
 
@@ -64,10 +81,11 @@ describe('FR-025 状態機械 — 全遷移', () => {
     store.getState().wasmReady()
     expect(store.getState().status).toBe('ready')
 
-    store.getState().startGenerating()
+    const epoch = store.getState().startGenerating()
+    expect(epoch).not.toBeNull()
     expect(store.getState().status).toBe('generating')
 
-    store.getState().generationSucceeded(summary)
+    store.getState().generationSucceeded(epoch!, summary)
     const s = store.getState()
     expect(s.status).toBe('success')
     expect(s.lastResult).toEqual(summary)
@@ -76,26 +94,25 @@ describe('FR-025 状態機械 — 全遷移', () => {
 
   it('generating → error', () => {
     store.getState().wasmReady()
-    store.getState().startGenerating()
-    store.getState().generationFailed({ code: 'EMPTY_RESULT' })
+    const epoch = store.getState().startGenerating()
+    store.getState().generationFailed(epoch!, { code: 'EMPTY_RESULT' })
     const s = store.getState()
     expect(s.status).toBe('error')
     expect(s.lastError).toEqual({ code: 'EMPTY_RESULT' })
   })
 
-  it('error → generating（入力変更で再生成できる）', () => {
+  it('error → generating（再生成できる）', () => {
     store.getState().wasmReady()
-    store.getState().startGenerating()
-    store.getState().generationFailed({ code: 'EMPTY_RESULT' })
-    store.getState().startGenerating()
+    const epoch = store.getState().startGenerating()
+    store.getState().generationFailed(epoch!, { code: 'EMPTY_RESULT' })
+    expect(store.getState().startGenerating()).not.toBeNull()
     expect(store.getState().status).toBe('generating')
   })
 
-  it('success → generating（入力変更で再生成できる）', () => {
+  it('success → generating（再生成できる）', () => {
     store.getState().wasmReady()
-    store.getState().startGenerating()
-    store.getState().generationSucceeded(summary)
-    store.getState().startGenerating()
+    generateSuccessfully(store)
+    expect(store.getState().startGenerating()).not.toBeNull()
     expect(store.getState().status).toBe('generating')
   })
 
@@ -119,10 +136,10 @@ describe('FR-025 状態機械 — 全遷移', () => {
     expect(store.getState().status).toBe('ready')
   })
 
-  it('許可されない遷移は no-op（stale なレスポンスなど）', () => {
-    // ready のまま success 通知が来ても無視する
+  it('許可されない遷移は no-op', () => {
+    // ready のまま success 通知が来ても無視する（epoch が正しくても状態が不正）
     store.getState().wasmReady()
-    store.getState().generationSucceeded(summary)
+    store.getState().generationSucceeded(store.getState().generationEpoch, summary)
     expect(store.getState().status).toBe('ready')
     expect(store.getState().lastResult).toBeNull()
 
@@ -131,10 +148,16 @@ describe('FR-025 状態機械 — 全遷移', () => {
     store.getState().wasmReady()
     expect(store.getState().status).toBe('generating')
 
-    // loading-wasm 中は生成を開始できない
+    // loading-wasm 中は生成を開始できない（null が返る）
     const fresh = createStudioStore()
-    fresh.getState().startGenerating()
+    expect(fresh.getState().startGenerating()).toBeNull()
     expect(fresh.getState().status).toBe('loading-wasm')
+
+    // init-failed 中も開始できない
+    const failed = createStudioStore()
+    failed.getState().wasmInitFailed('boom')
+    expect(failed.getState().startGenerating()).toBeNull()
+    expect(failed.getState().status).toBe('init-failed')
   })
 })
 
@@ -158,9 +181,9 @@ describe('FR-025 — loading-wasm はエラーではない', () => {
   it('出力は success かつ結果ありのときだけ有効', () => {
     store.getState().wasmReady()
     expect(selectCanExport(store.getState())).toBe(false)
-    store.getState().startGenerating()
+    const epoch = store.getState().startGenerating()
     expect(selectCanExport(store.getState())).toBe(false)
-    store.getState().generationSucceeded(summary)
+    store.getState().generationSucceeded(epoch!, summary)
     expect(selectCanExport(store.getState())).toBe(true)
   })
 
@@ -176,6 +199,100 @@ describe('FR-025 — loading-wasm はエラーではない', () => {
   })
 })
 
+describe('US-001 — 入力変更は直前の生成結果を破棄する', () => {
+  beforeEach(() => {
+    store.getState().wasmReady()
+  })
+
+  it('success 後に入力を変更すると結果は破棄され、出力は無効になる', () => {
+    generateSuccessfully(store)
+    store.getState().setWarnings(store.getState().generationEpoch, [emptyBandWarning])
+    expect(selectCanExport(store.getState())).toBe(true)
+
+    // レビュー指摘のシーケンス：square × circle の成功後に A を star へ
+    store.getState().setSilhouetteA(star)
+
+    const s = store.getState()
+    expect(s.status).not.toBe('success')
+    expect(s.status).toBe('ready')
+    expect(s.lastResult).toBeNull()
+    expect(s.warnings).toEqual([])
+    // 旧入力（square × circle）のメッシュを出力できてはならない
+    expect(selectCanExport(s)).toBe(false)
+  })
+
+  it('setSilhouetteB / resetShapes / restoreLastValidInput も同様に破棄する', () => {
+    generateSuccessfully(store)
+    store.getState().setSilhouetteB(heart)
+    expect(selectCanExport(store.getState())).toBe(false)
+    expect(store.getState().lastResult).toBeNull()
+
+    generateSuccessfully(store)
+    store.getState().resetShapes()
+    expect(selectCanExport(store.getState())).toBe(false)
+    expect(store.getState().lastResult).toBeNull()
+
+    generateSuccessfully(store)
+    store.getState().restoreLastValidInput(store.getState().generationEpoch)
+    expect(selectCanExport(store.getState())).toBe(false)
+    expect(store.getState().lastResult).toBeNull()
+  })
+
+  it('error 後の入力変更は stale なエラー表示も取り下げる', () => {
+    const epoch = store.getState().startGenerating()
+    store.getState().generationFailed(epoch!, { code: 'EMPTY_RESULT' })
+    expect(selectIsErrorState(store.getState())).toBe(true)
+
+    store.getState().setSilhouetteA(star)
+    expect(store.getState().status).toBe('ready')
+    expect(store.getState().lastError).toBeNull()
+  })
+
+  it('superseded な入力への遅延 success は無視される（結果が蘇らない）', () => {
+    const e1 = store.getState().startGenerating()
+
+    // 生成中にユーザーが入力を変更 → 実行中の生成は無効になる
+    store.getState().setSilhouetteA(star)
+    expect(store.getState().status).toBe('generating') // スピナーは維持
+
+    // 旧入力への遅延レスポンスが届く → 無視。出力可能になってはならない
+    store.getState().generationSucceeded(e1!, summary)
+    expect(store.getState().status).toBe('generating')
+    expect(store.getState().lastResult).toBeNull()
+    expect(selectCanExport(store.getState())).toBe(false)
+
+    // 最新入力の生成は開始でき（no-op ではない）、その結果は反映される
+    const e2 = store.getState().startGenerating()
+    expect(e2).not.toBeNull()
+    expect(e2).not.toBe(e1)
+    store.getState().generationSucceeded(e2!, summary)
+    expect(store.getState().status).toBe('success')
+    expect(selectCanExport(store.getState())).toBe(true)
+  })
+
+  it('generating 中の startGenerating は supersede（新しい epoch を返す）', () => {
+    const e1 = store.getState().startGenerating()
+    const e2 = store.getState().startGenerating()
+    expect(e2).not.toBeNull()
+    expect(e2).not.toBe(e1)
+    expect(store.getState().status).toBe('generating')
+
+    // 置き換えられた旧生成の失敗通知も無視される（スピナーは新生成が畳む）
+    store.getState().generationFailed(e1!, { code: 'EMPTY_RESULT' })
+    expect(store.getState().status).toBe('generating')
+
+    store.getState().generationFailed(e2!, { code: 'EMPTY_RESULT' })
+    expect(store.getState().status).toBe('error')
+  })
+
+  it('stale な setWarnings は無視される', () => {
+    const staleEpoch = store.getState().generationEpoch
+    store.getState().setSilhouetteA(star)
+    store.getState().setWarnings(staleEpoch, [emptyBandWarning])
+    expect(store.getState().warnings).toEqual([])
+  })
+})
+
 describe('FR-006 — リセットと直前入力の復帰', () => {
   it('resetShapes() で正方形 × 円に戻る', () => {
     store.getState().setSilhouetteA(star)
@@ -184,36 +301,90 @@ describe('FR-006 — リセットと直前入力の復帰', () => {
     expect(store.getState().input).toEqual(INITIAL_INPUT)
   })
 
-  it('SVG 拒否 → restoreLastValidInput() で直前の有効入力に戻る', () => {
-    // 有効な入力を受理
+  it('受理された入力だけが lastValidInput へ昇格する', () => {
+    // 設定しただけでは候補にすぎない
     store.getState().setSilhouetteA(star)
-    // 後に拒否される SVG がいったん受理される
+    expect(store.getState().lastValidInput).toEqual(INITIAL_INPUT)
+
+    // パイプラインが受理を通知して初めて昇格する
+    store.getState().inputAccepted(store.getState().generationEpoch)
+    expect(store.getState().lastValidInput).toEqual({
+      a: star,
+      b: INITIAL_INPUT.b,
+    })
+  })
+
+  it('SVG 拒否 → restoreLastValidInput() で直前の受理済み入力に戻る', () => {
+    // star が受理される
+    store.getState().setSilhouetteA(star)
+    store.getState().inputAccepted(store.getState().generationEpoch)
+
+    // 後に拒否される SVG がいったん候補として受け付けられる
     store.getState().setSilhouetteA(badSvg)
     expect(store.getState().input.a).toEqual(badSvg)
 
     // パイプラインが SVG を拒否 → 復帰
-    store.getState().restoreLastValidInput()
+    store.getState().restoreLastValidInput(store.getState().generationEpoch)
     expect(store.getState().input.a).toEqual(star)
     expect(store.getState().input.b).toEqual(INITIAL_INPUT.b)
   })
 
   it('履歴は 1 段のみ — 続けて呼んでも 2 段戻らない', () => {
-    store.getState().setSilhouetteA(star) // 1 段目（square → star）
-    store.getState().setSilhouetteA(badSvg) // 2 段目（star → badSvg）
+    store.getState().setSilhouetteA(star)
+    store.getState().inputAccepted(store.getState().generationEpoch) // star を受理
+    store.getState().setSilhouetteA(badSvg) // 候補（未受理）
 
-    store.getState().restoreLastValidInput()
+    store.getState().restoreLastValidInput(store.getState().generationEpoch)
     expect(store.getState().input.a).toEqual(star)
 
     // もう一度呼んでも star のまま。square（2 段前）へは戻らない
-    store.getState().restoreLastValidInput()
+    store.getState().restoreLastValidInput(store.getState().generationEpoch)
     expect(store.getState().input.a).toEqual(star)
   })
 
-  it('B 側の変更も履歴になる', () => {
+  it('B 側の変更も受理されれば復帰先になる', () => {
     store.getState().setSilhouetteB(heart)
+    store.getState().inputAccepted(store.getState().generationEpoch)
     store.getState().setSilhouetteB(badSvg)
-    store.getState().restoreLastValidInput()
+    store.getState().restoreLastValidInput(store.getState().generationEpoch)
     expect(store.getState().input.b).toEqual(heart)
+  })
+
+  it('検証中に別の編集が入っても未検証の入力は lastValidInput にならない', () => {
+    // レビュー指摘のレース：
+    // 1. 受理済みは square × circle（初期値）
+    // 2. A に不正 SVG → パイプラインが epoch を捕捉して検証を開始
+    store.getState().setSilhouetteA(badSvg)
+    const validatingEpoch = store.getState().generationEpoch
+
+    // 3. 拒否が返る**前**に B を heart へ変更
+    store.getState().setSilhouetteB(heart)
+
+    // badSvg を含むペアが復帰先に昇格していてはならない
+    expect(store.getState().lastValidInput).toEqual(INITIAL_INPUT)
+
+    // 4. 遅れて届いた拒否（stale epoch）による復帰は無視される —
+    //    最新の編集（badSvg × heart の検証待ち）を上書きしない
+    store.getState().restoreLastValidInput(validatingEpoch)
+    expect(store.getState().input).toEqual({ a: badSvg, b: heart })
+
+    // 最新 epoch での拒否 → 受理済みの square × circle へ復帰。
+    // 不正 SVG が復元されることは決してない
+    store.getState().restoreLastValidInput(store.getState().generationEpoch)
+    expect(store.getState().input).toEqual(INITIAL_INPUT)
+  })
+
+  it('stale な受理通知は現在の未検証入力を昇格させない', () => {
+    store.getState().setSilhouetteA(star)
+    const staleEpoch = store.getState().generationEpoch
+
+    // star の検証が終わる前に badSvg へ再編集
+    store.getState().setSilhouetteA(badSvg)
+
+    // 遅れて届いた star の受理通知 — 現在の入力は badSvg なので、
+    // これを昇格させてはならない
+    store.getState().inputAccepted(staleEpoch)
+    expect(store.getState().lastValidInput).toEqual(INITIAL_INPUT)
   })
 })
 
@@ -255,14 +426,9 @@ describe('オプション', () => {
 })
 
 describe('警告と結果メタデータ', () => {
-  it('setWarnings が警告リストを差し替える', () => {
-    store.getState().setWarnings([
-      {
-        code: 'EMPTY_BAND',
-        certainty: 'exact',
-        message: 'この高さで立体が途切れます',
-        band: [0.4, 0.6],
-      },
+  it('setWarnings が警告リストを差し替える（現在の epoch なら反映）', () => {
+    store.getState().setWarnings(store.getState().generationEpoch, [
+      emptyBandWarning,
     ])
     expect(store.getState().warnings).toHaveLength(1)
     expect(store.getState().warnings[0]!.code).toBe('EMPTY_BAND')
@@ -270,8 +436,8 @@ describe('警告と結果メタデータ', () => {
 
   it('成功時のメタデータに geometry を含まない（ADR-004）', () => {
     store.getState().wasmReady()
-    store.getState().startGenerating()
-    store.getState().generationSucceeded(summary)
+    const epoch = store.getState().startGenerating()
+    store.getState().generationSucceeded(epoch!, summary)
     const result = store.getState().lastResult
     expect(result).toEqual(summary)
     expect(result).not.toHaveProperty('geometry')
