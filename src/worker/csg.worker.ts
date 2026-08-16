@@ -3,6 +3,12 @@ import type { CrossSection, Manifold, ManifoldToplevel } from 'manifold-3d'
 import manifoldWasmUrl from 'manifold-3d/manifold.wasm?url'
 import { boundsOf } from '../geometry/normalize'
 import { toPolygons } from '../geometry/toPolygons'
+import {
+  createStageCursor,
+  PERF_ENABLED,
+  type WorkerCsgStage,
+  type WorkerPerfMessage,
+} from '../studio/perf'
 import type { CsgError, CsgRequest, CsgResponse, WorkerOutbound } from './protocol'
 
 /**
@@ -45,6 +51,20 @@ import type { CsgError, CsgRequest, CsgResponse, WorkerOutbound } from './protoc
  * 記録に対する検算でしかなく、ライブラリ内部のリークはヒープ高水位でしか
  * 見えない。Emscripten のヒープは `delete()` しても縮まないため、
  * 容量の**減少**を見る判定は必ず偽陽性になる（見るべきは「増えないこと」）。
+ *
+ * ## 工程計測（Task 7.2 / NFR-001）
+ *
+ * `performCsg` は工程境界（検証 / CrossSection / extrude / intersect / 台座 /
+ * MeshGL 取得 / 解放）に `performance.mark` を打ち、内訳を
+ * {@link getLastCsgBreakdown} に残す。Worker シェルはそれを
+ * `{ type: 'csg-perf' }` としてメインスレッドへ送る（`protocol.ts` の
+ * `WorkerOutbound` には**入れない** — 計測は本番プロトコルの一部ではなく、
+ * 公開ビルドでは送信ごと消える）。
+ *
+ * `elapsedMs` は `finally` の `delete()` 掃除を**含まない**（return 式の評価が
+ * finally より先）。掃除の実コストは `cleanup` として別に記録し、メインスレッド
+ * 側では往復（transport）に計上される — 予算表の「postMessage 往復 5ms」が
+ * 実際には何を含んでいるかは、この 2 つを並べないと分からない。
  */
 
 /** 押し出し深さのマージン（design.md「2. 押し出し深さ」。深さ算出自体は studio/ 側の責務） */
@@ -99,6 +119,21 @@ function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+/** 直近の `performCsg` の工程内訳（Task 7.2）。計測無効時は常に null */
+let lastCsgBreakdown: { generation: number; stages: Partial<Record<WorkerCsgStage, number>> } | null =
+  null
+
+/**
+ * 直近の `performCsg` の工程内訳。Worker シェルが `csg-perf` 通知に載せる。
+ * テストからは「早期 return したリクエストでも内訳が残る」ことの確認に使える。
+ */
+export function getLastCsgBreakdown(): Readonly<{
+  generation: number
+  stages: Partial<Record<WorkerCsgStage, number>>
+}> | null {
+  return lastCsgBreakdown
+}
+
 /**
  * リクエスト 1 件分のブール交差を実行する。
  *
@@ -138,6 +173,9 @@ function messageOf(err: unknown): string {
  */
 export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResponse {
   const startedAt = performance.now()
+  // 工程計測（Task 7.2）。計測無効時は no-op カーソルで、mark も measure も打たない
+  const perf = createStageCursor<WorkerCsgStage>('csg')
+  perf.enter('validate')
   const fail = (error: CsgError): CsgResponse => ({
     generation: request.generation,
     ok: false,
@@ -218,11 +256,13 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
       })
     }
 
+    perf.enter('section')
     sectionA = track(new wasm.CrossSection(polygonsA, 'Positive'))
     sectionB = track(new wasm.CrossSection(polygonsB, 'Positive'))
 
     // center: true は使用禁止（関数 doc の 2. 参照）— 非センタリングで押し出し、
     // センタリングは明示的に追跡した translate で行う
+    perf.enter('extrude')
     rawA = track(sectionA.extrude(request.a.depth, 0, 0, [1, 1], false))
     rawB = track(sectionB.extrude(request.b.depth, 0, 0, [1, 1], false))
     prismA = track(rawA.translate([0, 0, -request.a.depth / 2]))
@@ -231,6 +271,7 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
     // A は回転しない（XY 断面のまま +Z 押し出し）。B のみ +90° で +X へ
     prismB = track(centeredB.rotate([0, 90, 0]))
 
+    perf.enter('intersect')
     solid = track(prismA.intersect(prismB))
 
     const status = solid.status()
@@ -256,6 +297,7 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
     // 追跡不要。`cube` / `translate` / `add` は manifold.js 実装を確認済みで、
     // いずれも内部チェーンのない単一オブジェクト生成（冒頭「メモリ規律」の
     // 確認義務に基づく。extrude の center: true のような内部 translate はない）
+    perf.enter('baseplate')
     if (baseplate !== null) {
       const bounds = solid.boundingBox()
       const thickness = baseplate.height
@@ -291,6 +333,7 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
     // ではない — 解放は finally の個別変数（solid / based）でのみ行う
     const output: Manifold = based ?? solid
 
+    perf.enter('mesh')
     // 連結成分数の唯一の確定根拠。台座有効時は**結合後に再度** decompose した
     // 結果を報告する（FR-015: 最小 Y に届かない成分は台座に接続されないため、
     // 台座を付けても 1 にならないことがある — その事実をそのまま返す）。
@@ -328,6 +371,9 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
     // Wasm バインディング境界の予期しない失敗。詳細をそのまま診断情報に載せる
     return fail({ code: 'INVALID_INPUT', detail: messageOf(err) })
   } finally {
+    // `elapsedMs` は return 式の評価で確定済み。ここから先（delete() 掃除）は
+    // elapsedMs に入らず、メインスレッドでは往復（transport）に計上される
+    perf.enter('cleanup')
     // 生成の逆順に破棄：parts[]（逆順）→ based → plate → plateBox → solid
     // → prismB → centeredB → prismA → rawB → rawA → sectionB → sectionA。
     // decompose() の戻り配列が最も漏れやすい。台座なしの経路では
@@ -348,6 +394,9 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
     release(rawA)
     release(sectionB)
     release(sectionA)
+    perf.close()
+    lastCsgBreakdown = { generation: request.generation, stages: perf.durations }
+    perf.dispose()
   }
 }
 
@@ -363,7 +412,7 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
  */
 interface CsgWorkerScope {
   onmessage: ((event: MessageEvent<CsgRequest>) => void) | null
-  postMessage(message: WorkerOutbound, transfer?: Transferable[]): void
+  postMessage(message: WorkerOutbound | WorkerPerfMessage, transfer?: Transferable[]): void
 }
 
 /** Worker スコープ内で実行されているか（Node / メインスレッドでは false） */
@@ -407,6 +456,15 @@ async function handleRequest(scope: CsgWorkerScope, request: CsgRequest): Promis
   }
 
   const response = performCsg(wasm, request)
+  // 内訳を**先に**送る（応答は transferable を伴うので、受信側が応答を処理する
+  // 時点で内訳が揃っている必要がある）。公開ビルドではこのブロックごと消える
+  if (PERF_ENABLED && lastCsgBreakdown !== null && lastCsgBreakdown.generation === request.generation) {
+    scope.postMessage({
+      type: 'csg-perf',
+      generation: request.generation,
+      stages: lastCsgBreakdown.stages,
+    })
+  }
   if (response.ok) {
     scope.postMessage(response, [response.positions.buffer, response.indices.buffer])
   } else {

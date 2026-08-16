@@ -94,7 +94,28 @@
  * - `{ type: 'init-failed', detail }` / 初期化中の失敗 CsgResponse /
  *   初期化完了前の Worker `error` イベント / spawn 時の同期例外 — 初期化失敗
  * - どれも届かない — 10 秒タイムアウトが init-failed に落とす
+ *
+ * ## 工程計測（Task 7.2 / NFR-001）
+ *
+ * 本クライアントが記録するのは `debounce`（合流待ち）と `transport`（往復）で、
+ * 往復から Worker の実行時間（`CsgResponse.elapsedMs`）を差し引いた残りが
+ * 純粋な postMessage コストになる（`studio/perf.ts` の `stageAfterWorker`）。
+ * **`debounce` は design.md の予算表に存在しない工程**であり、既定 120ms は
+ * 予算合計 257ms の半分近い。計測は分岐も遅延も足さない（公開ビルドでは
+ * `perf.*` が空関数に畳まれる）。
+ *
+ * Worker が送る CSG 内訳（`{ type: 'csg-perf' }`）は `protocol.ts` の
+ * `WorkerOutbound` に**含まれない**別系統で、`handleMessage` の先頭で弾く —
+ * `type` を持つため、後段の `isLifecycleMessage` に食われてしまうため。
  */
+import {
+  abandonRun,
+  isWorkerPerfMessage,
+  PERF_ENABLED,
+  stage,
+  stageAfterWorker,
+  type WorkerCsgStage,
+} from '../studio/perf'
 import {
   isLifecycleMessage,
   type CsgError,
@@ -268,6 +289,12 @@ export class CsgWorkerClient {
   private pendingElapsed = false
   private inFlight: InFlightRequest | null = null
   private disposed = false
+  /**
+   * Worker から先に届いた CSG 内訳（Task 7.2）。世代 ID で対応付ける。
+   * 公開ビルドでは Worker が送らないので常に null のままになる。
+   */
+  private workerBreakdown: { generation: number; stages: Partial<Record<WorkerCsgStage, number>> } | null =
+    null
 
   /**
    * 生成した瞬間に Worker が起動し、Wasm 初期化が始まる（NFR-003 の先読み）。
@@ -310,6 +337,8 @@ export class CsgWorkerClient {
    */
   requestGeneration(payload: GenerationPayload): void {
     if (this.disposed) return
+    // 合流待ち（NFR-004）。予算表に無い工程で、既定 120ms
+    stage('debounce')
     // 新しい入力の受理＝実行中の生成の supersede。演算自体は中断できないが
     // （protocol.ts 冒頭）、結果の採用と再試行はこの時点で打ち切る
     this.inFlight = null
@@ -419,6 +448,14 @@ export class CsgWorkerClient {
   private handleMessage(data: unknown): void {
     if (this.disposed) return
     if (typeof data !== 'object' || data === null) return
+    // 計測通知は本番プロトコルの外側。`type` を持つので、ライフサイクル判定より
+    // **先に**弾かないと isLifecycleMessage に食われて捨てられる（Task 7.2）。
+    // `PERF_ENABLED` を前置しているのは、公開ビルドでこの分岐ごと消すため
+    // （無効時 Worker はそもそも送らない）
+    if (PERF_ENABLED && isWorkerPerfMessage(data)) {
+      this.workerBreakdown = { generation: data.generation, stages: data.stages }
+      return
+    }
     const message = data as WorkerOutbound
     if (isLifecycleMessage(message)) {
       if (message.type === 'ready') this.handleWorkerReady()
@@ -478,10 +515,17 @@ export class CsgWorkerClient {
     this.pendingElapsed = false
 
     const epoch = this.handlers.acquireEpoch()
-    if (epoch === null) return // store 側が開始不可（loading-wasm / init-failed）
+    if (epoch === null) {
+      // store 側が開始不可（loading-wasm / init-failed）、または studio 側の
+      // ゲートで却下された。この run は描画に到達しないので計測も打ち切る
+      abandonRun('dispatch-rejected')
+      return
+    }
 
     const generation = ++this.latestGeneration
     this.inFlight = { generation, epoch, payload, retriesLeft: 1 }
+    // postMessage 往復。応答受信時に Worker の実行時間を差し引く
+    stage('transport')
     // transfer リストは渡さない：points を転送すると neutered になり、
     // クラッシュ時に同じ payload を再送できなくなる。輪郭は高々数千点で
     // 構造化クローンのコストは無視できる（応答側の大きな配列は Worker が
@@ -500,6 +544,14 @@ export class CsgWorkerClient {
     if (inFlight === null || inFlight.generation !== response.generation) return
     this.inFlight = null
     if (response.ok) {
+      // 往復（transport）を閉じ、そこから Worker 実行時間を 'csg' へ切り出して
+      // 'mesh' 工程へ入る。内訳は世代 ID が一致するものだけを採用する
+      const breakdown =
+        this.workerBreakdown !== null && this.workerBreakdown.generation === response.generation
+          ? this.workerBreakdown.stages
+          : null
+      this.workerBreakdown = null
+      stageAfterWorker(response.elapsedMs, breakdown)
       this.handlers.onSuccess(inFlight.epoch, {
         positions: response.positions,
         indices: response.indices,

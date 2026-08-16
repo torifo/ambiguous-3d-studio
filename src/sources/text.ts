@@ -1,4 +1,3 @@
-import { parse } from 'opentype.js'
 import type { Font, PathCommand } from 'opentype.js'
 import type { Contour } from '../geometry/types'
 import { flipY } from '../geometry/normalize'
@@ -39,6 +38,19 @@ import { classifyRings, flattenCubicInto, flattenQuadraticInto } from './svg'
  * スタブ時代のシグネチャは Wave 4 の呼び出し側（useGenerationPipeline）との
  * 契約なので変更しない。スケール正規化（共通高さへのフィット）は呼び出し側の
  * normalize.ts が行うため、ここでは行わない。
+ *
+ * ## opentype.js は初回の文字入力まで読み込まない（Task 7.2 のバンドル分割）
+ *
+ * パーサ本体は 169.9kB（gzip 50.6kB）あり、ユーザーが**文字タブを使うまで
+ * 一度も必要ない**。`loadFont` の中の `await import('opentype.js')` に置いて
+ * あるので、起動時のメインチャンクには入らず、初回の文字入力で同梱フォントの
+ * `fetch` と**並行に**取得される。`textToContours` は元から
+ * `Promise<Contour[]>` を返す非同期関数なので、この変更は呼び出し側から
+ * まったく見えない（シグネチャは Wave 4 との契約 — 変えてはならない）。
+ * 型（`Font` / `PathCommand`）は `import type` なので実行時コードを生まない。
+ *
+ * 輪郭ユーティリティ（`./svg`）は静的 import のまま。理由は
+ * `studio/useGenerationPipeline.ts` の `resolveSource` を参照。
  */
 
 /** 受け付ける文字列（FR-002 / US-002）: 英数字 1〜8 文字。UI 側の検証と同一 */
@@ -85,7 +97,9 @@ function loadFont(fontId: string): Promise<Font> {
   if (cached !== undefined) return cached
   const loading = (async () => {
     const url = fontUrlOf(file)
-    const response = await fetch(url)
+    // パーサ本体（opentype.js）とフォント実体は独立に取れる。直列にすると
+    // 初回の文字入力で 2 往復ぶん待たされる
+    const [{ parse }, response] = await Promise.all([import('opentype.js'), fetch(url)])
     if (!response.ok) {
       throw new Error(`text: 同梱フォント ${url} を読み込めません（HTTP ${response.status}）`)
     }

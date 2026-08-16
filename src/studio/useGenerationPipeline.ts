@@ -40,6 +40,15 @@
  * （ADR-004）。参照の差し替えは store の状態変化（`status: 'success'` /
  * `lastResult` 更新）と同期しているので、Viewport は store を購読して
  * 再描画のタイミングを知り、実体は `geometryRef.current` から読む。
+ *
+ * ## 工程計測（Task 7.2 / NFR-001）
+ *
+ * `studio/perf.ts` のカーソルを工程境界に置く。ここが持つのは
+ * `contour` / `normalize` / `preflight` / `dispatch` / `render` の 5 工程で、
+ * `debounce` / `transport` / `csg` は `worker/client.ts` が、`csg` の内訳は
+ * `worker/csg.worker.ts` が記録する。**計測は工程の追加も分岐も行わない** —
+ * `perf.*` は公開ビルドで no-op に畳まれるので、呼び出し位置を動かす以外の
+ * 影響をパイプラインに与えてはならない。
  */
 import { useCallback, useEffect, useRef } from 'react'
 import type { BufferGeometry } from 'three'
@@ -59,6 +68,7 @@ import {
   type StudioOptions,
   type StudioState,
 } from '../store/useStudioStore'
+import { abandonRun, finishRunOnNextFrame, stage, startRun } from './perf'
 import { stlMmPerUnit } from './scale'
 
 /**
@@ -108,9 +118,18 @@ function messageOf(err: unknown): string {
 
 /**
  * 入力ソース → `Contour[]`。**全 3 分岐をここで書き切る**（Task 4.1）。
- * text / svg は Wave 1 のスタブを呼ぶ。Wave 6 はスタブの中身のみ差し替え、
- * この関数（とこのファイル）は編集しない。reject は呼び出し側で
- * 「入力の拒否」として扱われる。
+ * reject は呼び出し側で「入力の拒否」として扱われる。
+ *
+ * ## ここは静的 import のままにしてある（Task 7.2 のバンドル分割）
+ *
+ * `sources/svg.ts` を `await import()` に移すとメインチャンクを 19.4kB
+ * （gzip 7.4kB）減らせるが、拒否経路に非同期ホップが 1 つ増え、フェイク
+ * タイマーで駆動している既存の復帰テスト（「svg の拒否で直前の有効入力へ
+ * 復帰する」）が確定的に落ちる。得られる 7.4kB に対して割に合わないので
+ * 静的のまま残す。分割済みなのは `opentype.js`（gzip 50.6kB）だけで、
+ * これは `sources/text.ts` の中に閉じている。
+ * **preset も動的にしない** — 初期入力（正方形 × 円）は初回描画の依存で、
+ * 遅延させると初期表示そのものが遅くなる。
  */
 function resolveSource(source: SilhouetteSource): Promise<Contour[]> {
   switch (source.kind) {
@@ -212,7 +231,10 @@ export function createGenerationPipeline(
         // ref に触れる前に必ず epoch を突き合わせる（トラップ 2）。client の
         // 世代 ID と store の epoch 検査に加えた三重目の防御で、「レスポンス
         // 到着〜requestGeneration 発行」の隙間に届く旧世代を確実に弾く
-        if (epoch !== store.getState().generationEpoch) return
+        if (epoch !== store.getState().generationEpoch) {
+          abandonRun('stale-response')
+          return
+        }
         let geometry: BufferGeometry
         try {
           const mesh = {
@@ -224,12 +246,16 @@ export function createGenerationPipeline(
           geometry = meshGLToBufferGeometry(mesh)
         } catch (err) {
           // 転送途中の破損・契約違反。壊れたメッシュを描画・出力させない
+          abandonRun('mesh-invalid')
           store.getState().generationFailed(epoch, {
             code: 'NOT_MANIFOLD',
             detail: messageOf(err),
           })
           return
         }
+        // ここから先が描画ハンドオフ：ジオメトリ差し替え → store コミット →
+        // React 再レンダリング → 次フレームの描画発行（perf.ts の 'render' 解説）
+        stage('render')
         setGeometry(geometry)
         store.getState().generationSucceeded(epoch, {
           componentCount: result.componentCount,
@@ -237,9 +263,11 @@ export function createGenerationPipeline(
           triangleCount: result.indices.length / 3,
           elapsedMs: result.elapsedMs,
         })
+        finishRunOnNextFrame()
       },
       onError: (epoch, error) => {
         if (disposed) return
+        abandonRun(`generation-failed:${error.code}`)
         store.getState().generationFailed(epoch, error)
       },
       onReady: () => {
@@ -275,6 +303,11 @@ export function createGenerationPipeline(
         resolveSource(input.a),
         resolveSource(input.b),
       ])
+      // dispose 済みのパイプラインは計測に触らない。StrictMode の二重マウントでは
+      // 破棄済みパイプラインの process() が後から解決し、**新しいパイプラインの
+      // run** のカーソルを進めてしまう（計測だけの問題で、生成本体は下の
+      // disposed チェックで止まる）
+      if (!disposed) stage('normalize')
       contoursA = normalizeSilhouette(rawA, WORKING_HEIGHT).contours
       contoursB = normalizeSilhouette(rawB, WORKING_HEIGHT).contours
     } catch {
@@ -283,25 +316,35 @@ export function createGenerationPipeline(
       // 再編集されていた場合（epoch 不一致）は store 側が復帰を無視する。
       // 復帰自体も入力変更として epoch を進めるため、復帰先の入力で
       // このパイプラインが再度走り、対応するメッシュが再生成される
-      if (!disposed) store.getState().restoreLastValidInput(epoch)
+      if (!disposed) {
+        abandonRun('input-rejected')
+        store.getState().restoreLastValidInput(epoch)
+      }
       return
     }
-    if (disposed || epoch !== store.getState().generationEpoch) return
+    if (disposed || epoch !== store.getState().generationEpoch) {
+      if (!disposed) abandonRun('superseded-before-preflight')
+      return
+    }
 
     // 解析・正規化を実際に通過した今、有効入力としてコミットする（トラップ 3）
     store.getState().inputAccepted(epoch)
 
+    stage('preflight')
     const report = runPreflight(contoursA, contoursB)
     store.getState().setWarnings(epoch, report.warnings)
 
     // 生成のゲートは EMPTY_INTERSECTION の有無**のみ**（トラップ 1）。
     // `report.ok` は「警告ゼロ」であり、EMPTY_BAND があっても生成は実行する
+    // 深さ算出（bbox×2）とリクエスト組み立て。予算表にこの行は無い
+    stage('dispatch')
     if (report.warnings.some((w) => w.code === 'EMPTY_INTERSECTION')) {
       // Worker へはディスパッチしない。ただし実行中の生成が superseded の
       // まま残っていると status が generating で取り残される（旧世代の終端は
       // epoch 不一致で棄却されるため）ので、状態機械をここで終端させる。
       // Worker が空交差を計算したときと同じ EMPTY_RESULT に落とすことで、
       // プリフライト検出と演算検出が同じ提示（error + 警告の根拠）に揃う
+      abandonRun('empty-intersection')
       const settledEpoch = acquire()
       if (settledEpoch !== null) {
         store.getState().generationFailed(settledEpoch, { code: 'EMPTY_RESULT' })
@@ -336,6 +379,8 @@ export function createGenerationPipeline(
       // startGenerating の supersede による前進は入力変更ではない。
       // ref もパイプラインもそのまま（対応する入力は処理済み）
       if (inAcquireEpoch) return
+      // 計測 run の起点は「入力変更そのもの」。以降 render まで工程が連続する
+      startRun(state.generationEpoch)
       handledBaseplateSig = baseplateSignature(state.options)
       dispatchAllowed = false
       setGeometry(null)
@@ -346,6 +391,7 @@ export function createGenerationPipeline(
     // 指紋の変化で同じ epoch のまま再生成する
     const sig = baseplateSignature(state.options)
     if (sig === handledBaseplateSig) return
+    startRun(state.generationEpoch)
     handledBaseplateSig = sig
     dispatchAllowed = false
     setGeometry(null)
@@ -369,6 +415,7 @@ export function createGenerationPipeline(
     dispose: () => {
       if (disposed) return
       disposed = true
+      abandonRun('pipeline-disposed')
       unsubscribe()
       client.dispose()
       setGeometry(null)
