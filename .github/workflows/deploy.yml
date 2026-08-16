@@ -55,7 +55,12 @@ jobs:
           }
           echo "ok: wasm is emitted and referenced with the base prefix"
 
+      # enablement: true — リポジトリ側で Pages を有効化していない状態でも
+      # ここで有効化する（未設定だと configure-pages は 404 で落ちる）
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
