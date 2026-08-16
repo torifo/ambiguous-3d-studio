@@ -174,7 +174,11 @@ const textSource: SilhouetteSource = { kind: 'text', value: 'i', fontId: 'builti
 const svgSource: SilhouetteSource = {
   kind: 'svg',
   fileName: 'broken.svg',
-  raw: '<svg><rect width="1" height="1"/></svg>',
+  // 実装済みの svg.ts（Task 6.2）が**本当に拒否する**入力であること：
+  // ストロークのみで閉じた塗り対象パスがない SVG は FR-005 / US-002 により拒否される。
+  // （スタブ時代は何でも reject したため中身は不問だったが、実装後は
+  // 「拒否 → 復帰」の回帰テストとして実パーサの拒否経路を通る）
+  raw: '<svg><path d="M0 0 L1 1" stroke="black" fill="none"/></svg>',
 }
 
 beforeEach(() => {
