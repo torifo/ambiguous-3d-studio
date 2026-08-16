@@ -8,21 +8,25 @@
  * 選べば空帯は**必ず**生じるし、どの実装でも回避できない。したがって文言は
  * 失敗の語彙（エラー / 失敗 / 無効）を使わず、性質の説明として書く。
  *
- * `PreflightWarning.certainty` で文体を変える（geometry/types.ts の契約）：
+ * `certainty` で文体を変える（geometry/preflight.ts の `ViewpointPreflightWarning`
+ * — FR-101 で視点名を足した以外はコードも契約も geometry/types.ts の
+ * `PreflightWarning` と同一）：
  * - `'exact'`（スライス恒等式による断定）→「〜です」
  * - `'estimated'`（走査線サンプリングの推定）→「〜の可能性があります」
  * 断定 / 推定の区別はテキストバッジ（確定 / 推定）でも提示し、色に依存しない。
+ * 文言そのものは ./statusCopy.ts に切り出してある（Fast Refresh 対応。
+ * ui/liveAngleText.ts と同じ理由）。
  *
  * ## aria-live（FR-027）
  * ステータス行は `role="status"`、警告一覧は `aria-live="polite"` の常設
  * リージョンとして**常にマウントしておく**（後からリージョンごと現れた内容は
  * 支援技術に通知されないため、器を先に置き中身だけを差し替える）。
  */
-import { useStudioStore, type StudioStatus } from '../store/useStudioStore'
-import type { PreflightWarning } from '../geometry/types'
+import { selectIsOrthogonalAxes, useStudioStore, type StudioStatus } from '../store/useStudioStore'
 import type { CsgError } from '../worker/protocol'
 import { stlMmPerUnit } from '../studio/scale'
 import { WORKING_HEIGHT } from '../studio/useGenerationPipeline'
+import { formatLiveYRange, warningCopy, type WarningCopy } from './statusCopy'
 
 export interface StatusBannerProps {
   /**
@@ -52,21 +56,6 @@ const STATUS_LABELS: Record<StudioStatus, string> = {
 interface Copy {
   title: string
   body: string
-}
-
-/** 警告の文言 + 断定 / 推定を示すテキストバッジ（色以外の提示。FR-027） */
-interface WarningCopy extends Copy {
-  badge: '確定' | '推定'
-}
-
-/** 正規化 Y（−H/2〜+H/2）→ 立体の下端からの実寸 mm */
-function bandMm(y: number, heightMm: number): number {
-  return ((y + WORKING_HEIGHT / 2) / WORKING_HEIGHT) * heightMm
-}
-
-/** 作業座標系の幅 → 実寸 mm */
-function widthMm(width: number, heightMm: number): number {
-  return (width * heightMm) / WORKING_HEIGHT
 }
 
 /**
@@ -105,61 +94,6 @@ function describeError(error: CsgError): Copy {
   }
 }
 
-/**
- * プリフライト警告の文言（このタスクの本体）。
- *
- * certainty との対応を文体で守る：
- * - `'exact'`（EMPTY_INTERSECTION / EMPTY_BAND / SIMPLIFIED）→「〜です」と断定
- * - `'estimated'`（LIKELY_DISCONNECTED / THIN_NECK）→「〜の可能性があります」
- *
- * EMPTY_BAND に失敗の語彙は使わない — 離れたグリフや複数パーツの SVG では
- * **必ず**起きる正常な帰結であり、生成もそのまま実行される（FR-012 / US-001）。
- * 帯の位置と幅は走査線サンプリング由来なので数値には「約」を付ける
- * （帯が存在すること自体は断定できるが、端の位置は標本解像度に依存する）。
- *
- * switch は網羅的（default なし）— 警告コード追加時はコンパイルエラーになる。
- */
-function warningCopy(warning: PreflightWarning, heightMm: number): WarningCopy {
-  switch (warning.code) {
-    case 'EMPTY_INTERSECTION':
-      return {
-        badge: '確定',
-        title: '交差しない組み合わせです',
-        body: '2 つのシルエットが同じ高さで同時に材料を持つことがないため、この組み合わせの交差は空です。どちらかの図形を変えると立体が生成できます。',
-      }
-    case 'EMPTY_BAND': {
-      const [y0, y1] = warning.band
-      const lo = Math.round(bandMm(Math.min(y0, y1), heightMm))
-      const hi = Math.round(bandMm(Math.max(y0, y1), heightMm))
-      return {
-        badge: '確定',
-        title: 'シルエットが欠ける高さ帯があります',
-        body: `下から約 ${lo}〜${hi}mm の帯では片方のシルエットに材料がないため、この帯ではもう一方のシルエットも再現されません。これは不具合ではなく、離れたパーツを持つ図形（小文字の i や複数パーツの SVG など）で必ず生じる、この組み合わせの性質です。生成はそのまま行われます。`,
-      }
-    }
-    case 'LIKELY_DISCONNECTED':
-      return {
-        badge: '推定',
-        title: '複数パーツに分かれる可能性があります',
-        body: `走査線の解析では、立体が複数のパーツ（${warning.components} 個程度）に分かれる可能性があります。確定した数は生成後にパーツ数として表示されます。分かれたまま印刷すると別々の部品になります。`,
-      }
-    case 'THIN_NECK': {
-      const mm = widthMm(warning.minWidth, heightMm).toFixed(1)
-      return {
-        badge: '推定',
-        title: '細いくびれがある可能性があります',
-        body: `最も細い部分の幅は約 ${mm}mm と推定されます。この細さでは印刷時に折れたり、スライサーで消えたりする可能性があります。実寸を大きくするか、くびれの少ない図形にすると緩和できます。`,
-      }
-    }
-    case 'SIMPLIFIED':
-      return {
-        badge: '確定',
-        title: '輪郭を単純化しました',
-        body: `頂点数が上限（10,000）を超えたため、輪郭を ${warning.before} 点から ${warning.after} 点へ許容誤差付きで単純化しています。ごく細部は変わりますが、全体の形は保たれます。`,
-      }
-  }
-}
-
 /** 警告 1 件の表示。バッジ（確定 / 推定）はテキストなので色覚に依存しない */
 function WarningItem(props: { copy: WarningCopy }) {
   const { copy } = props
@@ -186,9 +120,14 @@ export function StatusBanner(props: StatusBannerProps) {
   const lastError = useStudioStore((s) => s.lastError)
   const warnings = useStudioStore((s) => s.warnings)
   const lastResult = useStudioStore((s) => s.lastResult)
+  const liveYRange = useStudioStore((s) => s.liveYRange)
   const heightMm = useStudioStore((s) => s.options.heightMm)
+  const axisAngleDeg = useStudioStore((s) => s.input.axisAngleDeg)
+  const isOrthogonalAxes = useStudioStore(selectIsOrthogonalAxes)
   const storeRetryInit = useStudioStore((s) => s.retryInit)
   const retry = props.onRetryInit ?? storeRetryInit
+  const warningCtx = { heightMm, axisAngleDeg, isOrthogonalAxes }
+  const liveRangeText = formatLiveYRange(liveYRange, heightMm)
 
   const errorCopy =
     (status === 'error' || status === 'init-failed') && lastError !== null
@@ -228,6 +167,12 @@ export function StatusBanner(props: StatusBannerProps) {
             {volumeCm3}cm³ ・ {Math.round(lastResult.elapsedMs)}ms
           </p>
         )}
+        {/* FR-101: すべての視点が同時に材料を持つ帯（liveYRange）。2 視点でも
+            3 視点でも意味は同じだが、3 視点では 2 視点よりずっと狭くなりうるため
+            常に mm で提示する（store.liveYRange の doc を参照） */}
+        {liveRangeText !== null && (
+          <p className="mt-0.5 text-[11px] text-neutral-500">{liveRangeText}</p>
+        )}
         {status === 'error' && errorCopy !== null && (
           <p className={`mt-1 rounded border p-2 text-neutral-300 ${errorTone}`}>
             {errorCopy.body}
@@ -266,7 +211,7 @@ export function StatusBanner(props: StatusBannerProps) {
               {warnings.map((warning, index) => (
                 <WarningItem
                   key={`${warning.code}-${index}`}
-                  copy={warningCopy(warning, heightMm)}
+                  copy={warningCopy(warning, warningCtx)}
                 />
               ))}
             </ul>

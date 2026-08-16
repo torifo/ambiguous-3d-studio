@@ -24,8 +24,7 @@
  * これはトレードオフの明示が要件そのもの — チェックボックスのラベルと
  * 説明文で、有効化するその場所で開示する（印刷後に気付かせない）。
  */
-import { useCallback, useId, useRef, useState, useSyncExternalStore } from 'react'
-import type { KeyboardEvent } from 'react'
+import { useCallback, useId, useRef, useSyncExternalStore } from 'react'
 import type { BufferGeometry } from 'three'
 import {
   MAX_BASEPLATE_MM,
@@ -40,7 +39,9 @@ import {
   type RealWorldSizeMm,
 } from '../studio/scale'
 import { WORKING_HEIGHT, type GeometryRef } from '../studio/useGenerationPipeline'
+import { AxisAngleControl } from './AxisAngleControl'
 import { ExportPanel } from './ExportPanel'
+import { NumberField } from './NumberField'
 import { SilhouettePicker } from './SilhouettePicker'
 import { StatusBanner } from './StatusBanner'
 import { SweetSpotIndicator, type SweetSpotIndicatorProps } from './SweetSpotIndicator'
@@ -111,75 +112,6 @@ function useRealWorldSize(
   return useSyncExternalStore(subscribe, getSnapshot)
 }
 
-interface NumberFieldProps {
-  id: string
-  label: string
-  value: number
-  min: number
-  max: number
-  step: number
-  disabled?: boolean
-  describedById?: string
-  /** 確定値の通知。丸め（clamp / step）はストア側の setter が行う */
-  onCommit: (value: number) => void
-}
-
-/**
- * 数値入力。範囲内の値は打鍵中も即時コミットし（ステッパー操作を含む）、
- * 範囲外・入力途中の値は blur / Enter で確定する。
- *
- * 編集中テキスト（draft）は「どのストア値の上で編集を始めたか」のタグ付きで
- * 保持し、ストア値が変わればタグが外れて表示は自動的にストア値へ戻る —
- * effect でストア値を setState へ写す同期は行わない（レンダー中に導出する）。
- */
-function NumberField(props: NumberFieldProps) {
-  const [draft, setDraft] = useState<{ text: string; baseValue: number } | null>(null)
-  const shown =
-    draft !== null && draft.baseValue === props.value ? draft.text : String(props.value)
-
-  const commitDraft = (): void => {
-    setDraft(null)
-    if (shown.trim() === '') return
-    const parsed = Number(shown)
-    if (Number.isFinite(parsed)) props.onCommit(parsed)
-  }
-
-  const handleChange = (raw: string): void => {
-    setDraft({ text: raw, baseValue: props.value })
-    const parsed = Number(raw)
-    if (raw.trim() === '' || !Number.isFinite(parsed)) return
-    if (parsed < props.min || parsed > props.max) return
-    // 整数刻みのフィールドでは、小数の入力途中（例: 45.5）を即時コミットすると
-    // ストア側の丸めが打鍵中の表示を跳ねさせるため、blur / Enter まで待つ
-    if (Number.isInteger(props.step) && !Number.isInteger(parsed)) return
-    props.onCommit(parsed)
-  }
-
-  return (
-    <div className="flex flex-col gap-1">
-      <label htmlFor={props.id} className="text-xs text-neutral-300">
-        {props.label}
-      </label>
-      <input
-        id={props.id}
-        type="number"
-        value={shown}
-        min={props.min}
-        max={props.max}
-        step={props.step}
-        disabled={props.disabled}
-        aria-describedby={props.describedById}
-        onChange={(event) => handleChange(event.target.value)}
-        onBlur={commitDraft}
-        onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-          if (event.key === 'Enter') commitDraft()
-        }}
-        className="min-h-11 w-full rounded border border-neutral-700 bg-neutral-900 px-2 text-sm text-neutral-100 disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
-      />
-    </div>
-  )
-}
-
 /** 視点スナップのボタン定義（FR-022）。`view` は scene/SweetSpot.ts の `SnapView` に対応 */
 const SNAP_BUTTONS: ReadonlyArray<{
   view: 'front' | 'side' | 'iso'
@@ -248,6 +180,11 @@ export function Sidebar({
 
       <SilhouettePicker viewpoint="a" />
       <SilhouettePicker viewpoint="b" />
+      {/* FR-102: 視点 B の押し出し軸角。既定 90°（直交）で従来と変わらない */}
+      <AxisAngleControl />
+      {/* FR-101: 視点 C は任意。既定は 2 視点で、追加は SilhouettePicker 側の
+          「視点 C を追加する」ボタンから。三方向変身立体は特例であり既定ではない */}
+      <SilhouettePicker viewpoint="c" />
 
       <section aria-labelledby={`${baseId}-options-heading`} className="flex flex-col gap-3">
         <h2 id={`${baseId}-options-heading`} className="text-xs font-semibold text-neutral-200">

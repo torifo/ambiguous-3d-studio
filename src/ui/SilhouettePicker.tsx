@@ -1,10 +1,22 @@
 /**
- * 視点 1 つ分の入力 UI（Task 5.2 / FR-001〜FR-006 / US-002）。
+ * 視点 1 つ分の入力 UI（Task 5.2 / FR-001〜FR-006 / FR-101 / US-002）。
  *
  * プリセット / 文字 / SVG の **3 タブすべて**をここで完結させる。Wave 6 は
  * 解析ロジック（sources/text.ts・sources/svg.ts のスタブ中身）だけを実装し、
  * この UI には触れない（tasks.md Task 5.2 Note）。スタブが reject する間も
  * UI の動作は同じ — コミット → パイプラインが拒否 → 直前の有効入力へ復帰。
+ *
+ * ## 視点 C は任意（FR-101）。既定は 2 視点、追加は特例
+ *
+ * `store.input.c` は `SilhouetteSource | null` で、A・B と違い**存在しない**
+ * ことがある。`viewpoint="c"` かつ `source === null` のときはタブ UI を出さず、
+ * 「視点 C を追加する」ボタンだけの控えめな入り口を出す — 三方向変身立体は
+ * 特例であり、デフォルトではないことを画面の面積比で示す。
+ *
+ * 追加後は A・B と同じタブ UI に、`setSilhouetteC(null)` で**確実に元の
+ * 2 視点状態へ戻せる**「視点 C を外す」ボタンを添えて出す。戻した瞬間の
+ * 結果は視点 C を一度も使わなかった場合と完全に同じ（store 側の保証）なので、
+ * ここでは「戻せる」ことを見た目にも明示するだけでよい。
  *
  * ## タブはローカル UI 状態（ストアと同期しない）
  *
@@ -91,7 +103,20 @@ const PRESET_LABELS: Record<PresetId, string> = {
 const VIEWPOINT_LABELS = {
   a: '視点 A（正面から見える形）',
   b: '視点 B（側面から見える形）',
+  c: '視点 C（真上から見た形）',
 } as const
+
+/**
+ * 視点 C を追加した直後の既定シルエット（FR-101）。円は高さ（C にとっては
+ * 奥行き）によらず広い被覆を持ち、追加直後に交差が空になりにくい —
+ * 既定の A・B（正方形 × 円）と組み合わせると illusion-catalogue.md が
+ * 「完全一致する組」として挙げる 正方形 × 円 × 円 になる、安全な初期値。
+ */
+const DEFAULT_VIEWPOINT_C_SOURCE: SilhouetteSource = { kind: 'preset', id: 'circle' }
+
+/** 44px 以上のタップ領域を持つ、控えめなセカンダリボタン（追加 / 除去の両方に使う） */
+const TOGGLE_BUTTON_CLASS =
+  'min-h-11 shrink-0 rounded border border-neutral-600 px-3 text-xs text-neutral-200 hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400'
 
 /** プリセットの形をそのまま示すピクトグラム（装飾。ラベルテキストが実体） */
 const ICON_SHAPES: Record<PresetId, ReactElement> = {
@@ -158,33 +183,43 @@ function rejectMessage(rejected: SilhouetteSource): string {
 }
 
 export interface SilhouettePickerProps {
-  /** どちらの視点の入力を編集するか。'a' = 正面、'b' = 側面 */
-  viewpoint: 'a' | 'b'
+  /** どの視点の入力を編集するか。'a' = 正面、'b' = 側面、'c' = 第 3 の視点（任意） */
+  viewpoint: 'a' | 'b' | 'c'
 }
 
-/** 視点 1 つ分の入力タブ（プリセット / 文字 / SVG）。状態はストアから読む */
+/**
+ * 視点 1 つ分の入力タブ（プリセット / 文字 / SVG）。状態はストアから読む。
+ * `viewpoint="c"` かつ未設定（null）のときは、タブの代わりに追加ボタンだけを出す。
+ */
 export function SilhouettePicker(props: SilhouettePickerProps) {
   const { viewpoint } = props
   const baseId = useId()
   const source = useStudioStore((s) => s.input[viewpoint])
   const lastValid = useStudioStore((s) => s.lastValidInput[viewpoint])
-  const setSource = useStudioStore((s) =>
-    viewpoint === 'a' ? s.setSilhouetteA : s.setSilhouetteB,
-  )
+  const setSilhouetteA = useStudioStore((s) => s.setSilhouetteA)
+  const setSilhouetteB = useStudioStore((s) => s.setSilhouetteB)
+  const setSilhouetteC = useStudioStore((s) => s.setSilhouetteC)
 
-  const [activeTab, setActiveTab] = useState<InputKind>(source.kind)
-  const [text, setText] = useState(source.kind === 'text' ? source.value : '')
+  const [activeTab, setActiveTab] = useState<InputKind>(source?.kind ?? 'preset')
+  const [text, setText] = useState(source?.kind === 'text' ? source.value : '')
   const [fileError, setFileError] = useState<string | null>(null)
   const [rejectNotice, setRejectNotice] = useState<string | null>(null)
   /** 自分がコミットしたが、まだ受理（lastValidInput 昇格）を確認していない入力 */
   const pendingRef = useRef<SilhouetteSource | null>(null)
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
 
-  /** ストアへのコミット。pending に控えてから書く（拒否検出のため） */
+  /**
+   * ストアへのコミット。pending に控えてから書く（拒否検出のため）。
+   * 視点 C を null に戻す操作（「視点 C を外す」ボタン）はこの経路を
+   * 通さない — null はパイプラインで検証されず常に即受理されるため、
+   * 拒否検出の対象にする意味がない（useGenerationPipeline.ts の分岐を参照）。
+   */
   const commit = (next: SilhouetteSource): void => {
     pendingRef.current = next
     setRejectNotice(null)
-    setSource(next)
+    if (viewpoint === 'a') setSilhouetteA(next)
+    else if (viewpoint === 'b') setSilhouetteB(next)
+    else setSilhouetteC(next)
   }
 
   // コミットした入力の行方を監視する：受理されたら pending を破棄、
@@ -253,11 +288,56 @@ export function SilhouettePicker(props: SilhouettePickerProps) {
 
   const notice = fileError ?? rejectNotice
 
+  // 視点 C 未設定（FR-101）。実行時に null になりうるのは 'c' だけ
+  // （StudioInput.a / .b は常に非 null）だが、ここでの分岐は viewpoint を
+  // 見ずに source そのものの null 判定にする — こうすると以降のコードで
+  // TypeScript が source を非 null（SilhouetteSource）へ絞り込める。
+  // タブ UI は出さず、追加ボタンだけの控えめな入り口にする —
+  // 三方向変身立体は特例であり、デフォルトの姿ではない
+  if (source === null) {
+    return (
+      <section
+        aria-labelledby={`${baseId}-heading`}
+        className="flex flex-col gap-2 rounded border border-dashed border-neutral-700 p-2"
+      >
+        <h2 id={`${baseId}-heading`} className="text-xs font-semibold text-neutral-200">
+          {VIEWPOINT_LABELS.c}（任意）
+        </h2>
+        <p className="text-[11px] text-neutral-500">
+          視点 C を足すと三方向変身立体になります。C は高さに依らず横から一様に削る固定領域なので
+          （A・B のような「高さごとの被覆」ではありません）、成立する組み合わせは A・B だけのときより
+          大幅に絞られます — 「3 つとも同じ高さを覆うか」ではなく、「A・B の被覆が、C の許す位置に
+          重なっているか」が条件です。
+        </p>
+        <button
+          type="button"
+          onClick={() => setSilhouetteC(DEFAULT_VIEWPOINT_C_SOURCE)}
+          className={TOGGLE_BUTTON_CLASS}
+        >
+          視点 C を追加する
+        </button>
+      </section>
+    )
+  }
+
   return (
     <section aria-labelledby={`${baseId}-heading`} className="flex flex-col gap-2">
-      <h2 id={`${baseId}-heading`} className="text-xs font-semibold text-neutral-200">
-        {VIEWPOINT_LABELS[viewpoint]}
-      </h2>
+      <div className="flex items-center justify-between gap-2">
+        <h2 id={`${baseId}-heading`} className="text-xs font-semibold text-neutral-200">
+          {VIEWPOINT_LABELS[viewpoint]}
+        </h2>
+        {/* FR-101: 外すと 2 視点状態へ確実に戻る（store 側で保証済み）。
+            目立つ位置に常設し、「追加は可逆」であることを見た目でも示す */}
+        {viewpoint === 'c' && (
+          <button
+            type="button"
+            onClick={() => setSilhouetteC(null)}
+            className={TOGGLE_BUTTON_CLASS}
+          >
+            視点 C を外す（2 視点に戻る）
+          </button>
+        )}
+      </div>
 
       <div
         role="tablist"
