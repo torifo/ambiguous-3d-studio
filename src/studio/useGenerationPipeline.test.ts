@@ -30,7 +30,12 @@ import {
   type WorkerLike,
 } from '../worker/client'
 import { DEPTH_MARGIN as WORKER_DEPTH_MARGIN, performCsg } from '../worker/csg.worker'
-import type { CsgRequest, CsgResponse } from '../worker/protocol'
+import {
+  computeDepths,
+  viewpointCamera,
+  type CsgRequest,
+  type CsgResponse,
+} from '../worker/protocol'
 import {
   createGenerationPipeline,
   DEPTH_MARGIN,
@@ -467,4 +472,243 @@ describe('押し出し深さ（FR-011）', () => {
       expect(response.positions.length).toBeGreaterThan(0)
     }
   }, 30_000)
+})
+
+describe('視点 C（FR-101）', () => {
+  it('2 視点のリクエストは C を足す前と同一（c は null、軸角は 90）', async () => {
+    const h = makeHarness()
+    h.workers[0].emitReady()
+    await settle()
+
+    const req = h.workers[0].requests[0]
+    // 正方形（幅 2）× 円（直径 2）：従来の式そのままの値になること（近似ではなく厳密）
+    expect(req.a.depth).toBe(2 * (1 + DEPTH_MARGIN))
+    expect(req.b.depth).toBe(2 * (1 + DEPTH_MARGIN))
+    expect(req.c).toBeNull()
+    expect(req.axisAngleDeg).toBe(90)
+  })
+
+  it('視点 C を設定すると c 付きのリクエストになり、深さが深さ規則に一致する', async () => {
+    const h = makeHarness()
+    await boot(h)
+
+    h.store.getState().setSilhouetteC({ kind: 'preset', id: 'triangle' })
+    await settle()
+
+    expect(h.workers[0].requests).toHaveLength(2)
+    const req = h.workers[0].requests[1]
+    expect(req.c).not.toBeNull()
+    expect(req.c!.contours.length).toBeGreaterThan(0)
+
+    // 深さは protocol.ts の computeDepths が唯一の根拠。パイプラインが
+    // 自前の式に戻っていないことを、同じ関数の出力との一致で固定する
+    const extent = (contours: Contour[]) => {
+      const b = boundsOf(contours)
+      return { width: b.maxX - b.minX, height: b.maxY - b.minY }
+    }
+    const expected = computeDepths({
+      a: extent(req.a.contours),
+      b: extent(req.b.contours),
+      c: extent(req.c!.contours),
+    })
+    expect(req.a.depth).toBe(expected.a)
+    expect(req.b.depth).toBe(expected.b)
+    expect(req.c!.depth).toBe(expected.c)
+
+    // 正規化で全シルエットの高さが H=2 に揃うので、C の深さは 2 × (1 + margin)
+    expect(req.c!.depth).toBeCloseTo(WORKING_HEIGHT * (1 + DEPTH_MARGIN), 12)
+    // A の深さは「B の幅」と「C の高さ」の大きい方（三角形は幅 2.309）
+    expect(req.a.depth).toBeGreaterThanOrEqual(2 * (1 + DEPTH_MARGIN))
+  })
+
+  it('live 帯（FR-101）がストアに載り、C を足すと狭くなる', async () => {
+    const h = makeHarness()
+    await boot(h)
+    const twoViewpoints = h.store.getState().liveYRange
+    expect(twoViewpoints).not.toBeNull()
+    // 正方形 × 円は全高が立体になる（共通高さ H = 2、中心原点）
+    expect(twoViewpoints![0]).toBeLessThan(-0.99)
+    expect(twoViewpoints![1]).toBeGreaterThan(0.99)
+
+    // C に「上下 2 本の棒（中央が空）」を入れると、C の材料がある奥行きに
+    // 制限され、B（円）の断面と噛み合わない高さが出る
+    vi.mocked(textToContours).mockImplementationOnce(() =>
+      Promise.resolve(iShapeContours()),
+    )
+    h.store.getState().setSilhouetteC(textSource)
+    await settle()
+
+    const s = h.store.getState()
+    expect(s.warnings.some((w) => w.code === 'EMPTY_BAND')).toBe(true)
+    const cBand = s.warnings.find((w) => w.code === 'EMPTY_BAND')
+    if (cBand?.code !== 'EMPTY_BAND') return
+    expect(cBand.side).toBe('C')
+  })
+
+  it('視点 C を外すと、C を一度も使わなかったリクエストに戻る', async () => {
+    const h = makeHarness()
+    await boot(h)
+    const baseline = h.workers[0].requests[0]
+
+    h.store.getState().setSilhouetteC({ kind: 'preset', id: 'triangle' })
+    await settle()
+    h.store.getState().setSilhouetteC(null)
+    await settle()
+
+    const req = h.workers[0].requests.at(-1)!
+    expect(req.c).toBeNull()
+    expect(req.a.depth).toBe(baseline.a.depth)
+    expect(req.b.depth).toBe(baseline.b.depth)
+  })
+
+  it('視点 C の解決失敗も入力の拒否として直前の有効入力へ復帰する（FR-006）', async () => {
+    const h = makeHarness()
+    await boot(h)
+
+    h.store.getState().setSilhouetteC(svgSource)
+    await settle()
+
+    const s = h.store.getState()
+    expect(s.input).toEqual(INITIAL_INPUT)
+    expect(s.input.c).toBeNull()
+    expect(s.lastValidInput).toEqual(INITIAL_INPUT)
+    // 復帰した入力で再生成される
+    expect(h.workers[0].requests).toHaveLength(2)
+    expect(h.workers[0].requests[1].c).toBeNull()
+  })
+
+  it('C が共通帯のどこにも被覆を持たない三つ組は EMPTY_INTERSECTION で C を名指しし、送出しない', async () => {
+    const h = makeHarness()
+    await boot(h)
+
+    // C は「外輪郭と同一の穴」で被覆が常に空 → どの高さでもスライスが空
+    vi.mocked(textToContours).mockImplementationOnce(() =>
+      Promise.resolve(emptyCoverageContours()),
+    )
+    h.store.getState().setSilhouetteC(textSource)
+    await settle(1000)
+
+    expect(h.workers[0].requests).toHaveLength(1)
+    const s = h.store.getState()
+    const warning = s.warnings.find((w) => w.code === 'EMPTY_INTERSECTION')
+    expect(warning).toBeDefined()
+    if (warning?.code !== 'EMPTY_INTERSECTION') return
+    expect(warning.emptySides).toEqual(['C'])
+    expect(s.status).toBe('error')
+    expect(s.lastError).toEqual({ code: 'EMPTY_RESULT' })
+  })
+
+  it('3 視点のリクエストがそのまま実 Wasm の検証と演算を通過する', async () => {
+    const h = makeHarness()
+    h.workers[0].emitReady()
+    h.store.getState().applyInput({
+      a: { kind: 'preset', id: 'square' },
+      b: { kind: 'preset', id: 'circle' },
+      c: { kind: 'preset', id: 'circle' },
+    })
+    await settle()
+    const req = h.workers[0].requests.at(-1)!
+    expect(req.c).not.toBeNull()
+
+    vi.useRealTimers()
+    const wasm = await createManifold()
+    wasm.setup()
+    const response = performCsg(wasm, req)
+    expect(response.ok).toBe(true)
+    if (response.ok) {
+      expect(response.componentCount).toBe(1)
+      expect(response.positions.length).toBeGreaterThan(0)
+    }
+  }, 30_000)
+})
+
+describe('斜交軸（FR-102）', () => {
+  it('軸角の変更が再生成を起こし、深さが斜交の式に従う', async () => {
+    const h = makeHarness()
+    await boot(h)
+    const orthogonal = h.workers[0].requests[0]
+
+    h.store.getState().setAxisAngleDeg(45)
+    await settle()
+
+    expect(h.workers[0].requests).toHaveLength(2)
+    const req = h.workers[0].requests[1]
+    expect(req.axisAngleDeg).toBe(45)
+
+    // 直交式（相手 bbox 幅 × margin）のままなら、この不等式で落ちる
+    expect(req.a.depth).toBeGreaterThan(orthogonal.a.depth)
+    expect(req.b.depth).toBeGreaterThan(orthogonal.b.depth)
+
+    // (wB + wA·cos45°) / sin45° × (1 + margin)。どちらの幅も 2
+    const expected = ((2 + 2 * Math.SQRT1_2) / Math.SQRT1_2) * (1 + DEPTH_MARGIN)
+    expect(req.a.depth).toBeCloseTo(expected, 10)
+    expect(req.b.depth).toBeCloseTo(expected, 10)
+  })
+
+  it('90° に戻すと直交のリクエストと厳密に一致する', async () => {
+    const h = makeHarness()
+    await boot(h)
+    const orthogonal = h.workers[0].requests[0]
+
+    h.store.getState().setAxisAngleDeg(45)
+    await settle()
+    h.store.getState().setAxisAngleDeg(90)
+    await settle()
+
+    const req = h.workers[0].requests.at(-1)!
+    expect(req.axisAngleDeg).toBe(90)
+    expect(req.a.depth).toBe(orthogonal.a.depth)
+    expect(req.b.depth).toBe(orthogonal.b.depth)
+  })
+
+  it('斜交 45° のリクエストがそのまま実 Wasm の検証と演算を通過する', async () => {
+    const h = makeHarness()
+    h.workers[0].emitReady()
+    h.store.getState().applyInput({
+      a: { kind: 'preset', id: 'square' },
+      b: { kind: 'preset', id: 'circle' },
+      axisAngleDeg: 45,
+    })
+    await settle()
+    const req = h.workers[0].requests.at(-1)!
+    expect(req.axisAngleDeg).toBe(45)
+
+    vi.useRealTimers()
+    const wasm = await createManifold()
+    wasm.setup()
+    const response = performCsg(wasm, req)
+    expect(response.ok).toBe(true)
+    if (response.ok) {
+      expect(response.componentCount).toBe(1)
+    }
+  }, 30_000)
+})
+
+describe('カメラ規約の公開（Wave 5 への契約）', () => {
+  it('A / B / C の視点方向と up。C の up は −Z（+Z にすると C だけ鏡像になる）', () => {
+    expect(viewpointCamera('A')).toEqual({ direction: [0, 0, 1], up: [0, 1, 0] })
+    // 直交では従来どおり +X 側
+    expect(viewpointCamera('B')).toEqual({ direction: [1, 0, 0], up: [0, 1, 0] })
+    expect(viewpointCamera('C')).toEqual({ direction: [0, 1, 0], up: [0, 0, -1] })
+  })
+
+  it('斜交では側面カメラが押し出し軸 (sin φ, 0, cos φ) の側へ回る', () => {
+    const camera = viewpointCamera('B', 45)
+    expect(camera.direction[0]).toBeCloseTo(Math.SQRT1_2, 12)
+    expect(camera.direction[1]).toBe(0)
+    expect(camera.direction[2]).toBeCloseTo(Math.SQRT1_2, 12)
+    expect(camera.up).toEqual([0, 1, 0])
+
+    // 画面右 = up × backward が B の断面ローカル +X = (cos φ, 0, −sin φ) と一致する
+    const [dx, dy, dz] = camera.direction
+    const [ux, uy, uz] = camera.up
+    const right: [number, number, number] = [
+      uy * dz - uz * dy,
+      uz * dx - ux * dz,
+      ux * dy - uy * dx,
+    ]
+    expect(right[0]).toBeCloseTo(Math.cos(Math.PI / 4), 12)
+    expect(right[1]).toBeCloseTo(0, 12)
+    expect(right[2]).toBeCloseTo(-Math.sin(Math.PI / 4), 12)
+  })
 })

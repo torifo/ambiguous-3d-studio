@@ -9,7 +9,17 @@ import {
   type WorkerCsgStage,
   type WorkerPerfMessage,
 } from '../studio/perf'
-import type { CsgError, CsgRequest, CsgResponse, WorkerOutbound } from './protocol'
+import {
+  axisAngleError,
+  computeDepths,
+  DEFAULT_AXIS_ANGLE_DEG,
+  DEPTH_MARGIN,
+  type CsgError,
+  type CsgRequest,
+  type CsgResponse,
+  type SilhouetteExtent,
+  type WorkerOutbound,
+} from './protocol'
 
 /**
  * CSG Worker 本体（Task 3.1 / design.md「4. Worker 境界」「2.1 軸の割り当て」）。
@@ -37,7 +47,9 @@ import type { CsgError, CsgRequest, CsgResponse, WorkerOutbound } from './protoc
  * `CrossSection` / `Manifold` は Wasm 所有オブジェクトで GC されない。
  * **メソッドチェーン禁止** — チェーンすると中間オブジェクトへの参照が残らず
  * `delete()` できない。全オブジェクトを個別変数に保持し、`finally` で
- * 生成の逆順に破棄する。
+ * 生成の逆順に破棄する。**視点 C（FR-101）を足したときも同じ規律**：
+ * `sectionC` / `rawC` / `centeredC` / `prismC` / `solidABC` の 5 個が
+ * 増え、いずれも個別変数で追跡して逆順に解放する。
  *
  * **ライブラリ内部でチェーンする API も禁止**。`extrude(..., center: true)` は
  * manifold.js 内部で `man.translate(...)` をチェーンし、中間の `man` が JS 側に
@@ -67,8 +79,12 @@ import type { CsgError, CsgRequest, CsgResponse, WorkerOutbound } from './protoc
  * 実際には何を含んでいるかは、この 2 つを並べないと分からない。
  */
 
-/** 押し出し深さのマージン（design.md「2. 押し出し深さ」。深さ算出自体は studio/ 側の責務） */
-export const DEPTH_MARGIN = 0.02
+/**
+ * 押し出し深さのマージン（design.md「2. 押し出し深さ」。深さ算出自体は studio/
+ * 側の責務）。値は `protocol.ts` が唯一の定義で、ここは再輸出にすぎない —
+ * 定数を 2 か所に書くと必ず片方だけ動く。
+ */
+export { DEPTH_MARGIN }
 
 /** 台座フットプリントの拡大率（FR-015: 立体の XZ バウンディングボックス × 1.15） */
 export const BASEPLATE_FOOTPRINT_SCALE = 1.15
@@ -146,10 +162,15 @@ export function getLastCsgBreakdown(): Readonly<{
  *    translate をチェーンし、中間 Manifold が毎回 2 個リークする
  *    （ファイル冒頭「メモリ規律」参照）。センタリングは明示的な translate で行い、
  *    押し出し結果・平行移動結果の両方を追跡・破棄する
- * 3. B のみ `rotate([0, 90, 0])` — Y 軸まわり **+90°** で押し出し軸を
- *    world +X へ向ける。回転は `(x, y, z) → (z, y, −x)` であり、この符号は
- *    +X 側カメラの規約と対で確定している。**符号を変えると B が鏡像になる**
- * 4. `prismA.intersect(prismB)`
+ * 3. B は `rotate([0, axisAngleDeg, 0])` — Y 軸まわり **+φ°**（既定 90°）で
+ *    押し出し軸を world `(sin φ, 0, cos φ)` へ向ける。φ=90° の回転は
+ *    `(x, y, z) → (z, y, −x)` であり、この符号は +X 側カメラの規約と対で
+ *    確定している。**符号を変えると B が鏡像になる**。
+ *    C は `rotate([-90, 0, 0])` — X 軸まわり **−90°** で `(x, y, z) → (x, z, −y)`、
+ *    押し出し軸を world **+Y** へ向ける（protocol.ts の `VIEWPOINT_AXES`）。
+ *    **符号を変えると C が上下反転する**
+ * 4. `prismA.intersect(prismB)`、視点 C があればさらに `.intersect(prismC)`
+ *    （`M = M_A ∩ M_B ∩ M_C` — FR-101）
  * 5. `status() !== 'NoError'` で破棄（文字列リテラル比較 — `NoError` という
  *    識別子は存在しない。ADR-006）
  * 6. 台座（FR-015 / Task 6.4）が有効なら、交差結果の bbox から台座を組み
@@ -162,10 +183,12 @@ export function getLastCsgBreakdown(): Readonly<{
  *    **新規 typed array にコピーしてから**返す
  *
  * 深さの防御的検証：深さの**算出**は studio 側（Wave 4）の責務だが、対向
- * シルエットの幅に足りない深さを受けても Manifold は `'NoError'` の正常な
+ * シルエットの広がりに足りない深さを受けても Manifold は `'NoError'` の正常な
  * 2-多様体を返すため、ここで拒否しない限り**欠けた立体が成功として通る**。
- * `a.depth >= width(B) × (1 + DEPTH_MARGIN)`（および対称に b）を検証し、
- * 不足は `INVALID_INPUT` で不足量を明示して拒否する。
+ * 要求値は `protocol.ts` の {@link computeDepths}（算出側と同一関数）で求め、
+ * 不足は `INVALID_INPUT` で不足量を明示して拒否する。視点 C と斜交軸を足しても
+ * 検証式は同じ関数のままなので、**C だけ検証が抜けて静かに切り落とされる**
+ * ことはない。
  *
  * エラー分類：入力起因（輪郭検証・深さ・台座厚）は `INVALID_INPUT`、
  * エンジンが不正メッシュを報告したら `NOT_MANIFOLD`（detail に `status()` の
@@ -203,18 +226,38 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
       detail: `b.depth must be a positive finite number (got ${request.b.depth})`,
     })
   }
+  // 視点 C（FR-101）。null / undefined は「2 視点」として従来経路をそのまま通る
+  const requestC = request.c ?? null
+  if (requestC !== null && (!Number.isFinite(requestC.depth) || requestC.depth <= 0)) {
+    return fail({
+      code: 'INVALID_INPUT',
+      detail: `c.depth must be a positive finite number (got ${requestC.depth})`,
+    })
+  }
+  // 軸角（FR-102）。省略は 90°（直交）で、算出側と同じ既定値
+  const axisAngleDeg = request.axisAngleDeg ?? DEFAULT_AXIS_ANGLE_DEG
+  const angleError = axisAngleError(axisAngleDeg)
+  if (angleError !== null) {
+    return fail({ code: 'INVALID_INPUT', detail: angleError })
+  }
 
   // 生成される Wasm オブジェクトの全量を個別変数で保持する（チェーン禁止）。
+  // 視点 C（FR-101）の sectionC / rawC / centeredC / prismC / solidABC、
   // 台座（Task 6.4）の plateBox / plate / based も同じ規律：宣言と生成を
   // この並び（生成順）に揃え、finally では生成の逆順で破棄する。
   let sectionA: CrossSection | null = null
   let sectionB: CrossSection | null = null
+  let sectionC: CrossSection | null = null
   let rawA: Manifold | null = null
   let rawB: Manifold | null = null
+  let rawC: Manifold | null = null
   let prismA: Manifold | null = null
   let centeredB: Manifold | null = null
+  let centeredC: Manifold | null = null
   let prismB: Manifold | null = null
-  let solid: Manifold | null = null
+  let prismC: Manifold | null = null
+  let solidAB: Manifold | null = null
+  let solidABC: Manifold | null = null
   let plateBox: Manifold | null = null
   let plate: Manifold | null = null
   let based: Manifold | null = null
@@ -223,56 +266,91 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
   try {
     let polygonsA: [number, number][][]
     let polygonsB: [number, number][][]
+    let polygonsC: [number, number][][] | null = null
     try {
       polygonsA = toPolygons(request.a.contours)
       polygonsB = toPolygons(request.b.contours)
+      if (requestC !== null) polygonsC = toPolygons(requestC.contours)
     } catch (err) {
       return fail({ code: 'INVALID_INPUT', detail: messageOf(err) })
     }
 
     // 深さの防御的検証（関数 doc 参照）。toPolygons 成功後なので boundsOf は
-    // 投げない（同じ不変条件を検証済み）。等値は許容（深さ算出側と同一式のため）、
-    // 浮動小数点の経路差だけを相対 1e-9 で吸収する
-    const boundsA = boundsOf(request.a.contours)
-    const boundsB = boundsOf(request.b.contours)
-    const requiredDepthA = (boundsB.maxX - boundsB.minX) * (1 + DEPTH_MARGIN)
-    const requiredDepthB = (boundsA.maxX - boundsA.minX) * (1 + DEPTH_MARGIN)
-    if (request.a.depth < requiredDepthA * (1 - 1e-9)) {
+    // 投げない（同じ不変条件を検証済み）。等値は許容（深さ算出側と**同一関数**の
+    // ため）、浮動小数点の経路差だけを相対 1e-9 で吸収する
+    const extentOf = (contours: typeof request.a.contours): SilhouetteExtent => {
+      const b = boundsOf(contours)
+      return { width: b.maxX - b.minX, height: b.maxY - b.minY }
+    }
+    let required: ReturnType<typeof computeDepths>
+    try {
+      required = computeDepths({
+        a: extentOf(request.a.contours),
+        b: extentOf(request.b.contours),
+        c: requestC === null ? null : extentOf(requestC.contours),
+        axisAngleDeg,
+      })
+    } catch (err) {
+      return fail({ code: 'INVALID_INPUT', detail: messageOf(err) })
+    }
+    const shortfall = (name: 'a' | 'b' | 'c', axis: string, depth: number, need: number): string =>
+      `${name}.depth ${depth} does not span the other prisms along its extrusion axis (${axis}) — ` +
+      `need >= ${need} (computeDepths, protocol.ts); the intersection would be silently clipped`
+    if (request.a.depth < required.a * (1 - 1e-9)) {
       return fail({
         code: 'INVALID_INPUT',
-        detail:
-          `a.depth ${request.a.depth} does not cover silhouette B along Z — ` +
-          `need >= ${requiredDepthA} (= width(B) * (1 + DEPTH_MARGIN)); ` +
-          'the intersection would be silently clipped',
+        detail: shortfall('a', '+Z', request.a.depth, required.a),
       })
     }
-    if (request.b.depth < requiredDepthB * (1 - 1e-9)) {
+    if (request.b.depth < required.b * (1 - 1e-9)) {
       return fail({
         code: 'INVALID_INPUT',
-        detail:
-          `b.depth ${request.b.depth} does not cover silhouette A along X — ` +
-          `need >= ${requiredDepthB} (= width(A) * (1 + DEPTH_MARGIN)); ` +
-          'the intersection would be silently clipped',
+        detail: shortfall('b', `${axisAngleDeg}° in XZ`, request.b.depth, required.b),
+      })
+    }
+    if (requestC !== null && required.c !== null && requestC.depth < required.c * (1 - 1e-9)) {
+      return fail({
+        code: 'INVALID_INPUT',
+        detail: shortfall('c', '+Y', requestC.depth, required.c),
       })
     }
 
     perf.enter('section')
     sectionA = track(new wasm.CrossSection(polygonsA, 'Positive'))
     sectionB = track(new wasm.CrossSection(polygonsB, 'Positive'))
+    if (polygonsC !== null) {
+      sectionC = track(new wasm.CrossSection(polygonsC, 'Positive'))
+    }
 
     // center: true は使用禁止（関数 doc の 2. 参照）— 非センタリングで押し出し、
     // センタリングは明示的に追跡した translate で行う
     perf.enter('extrude')
     rawA = track(sectionA.extrude(request.a.depth, 0, 0, [1, 1], false))
     rawB = track(sectionB.extrude(request.b.depth, 0, 0, [1, 1], false))
+    if (sectionC !== null && requestC !== null) {
+      rawC = track(sectionC.extrude(requestC.depth, 0, 0, [1, 1], false))
+    }
     prismA = track(rawA.translate([0, 0, -request.a.depth / 2]))
     centeredB = track(rawB.translate([0, 0, -request.b.depth / 2]))
+    if (rawC !== null && requestC !== null) {
+      centeredC = track(rawC.translate([0, 0, -requestC.depth / 2]))
+    }
 
-    // A は回転しない（XY 断面のまま +Z 押し出し）。B のみ +90° で +X へ
-    prismB = track(centeredB.rotate([0, 90, 0]))
+    // A は回転しない（XY 断面のまま +Z 押し出し）。B は Y 軸まわり +φ°（既定 90°）で
+    // 押し出し軸を (sin φ, 0, cos φ) へ、C は X 軸まわり −90° で +Y へ向ける
+    prismB = track(centeredB.rotate([0, axisAngleDeg, 0]))
+    if (centeredC !== null) {
+      prismC = track(centeredC.rotate([-90, 0, 0]))
+    }
 
     perf.enter('intersect')
-    solid = track(prismA.intersect(prismB))
+    solidAB = track(prismA.intersect(prismB))
+    if (prismC !== null) {
+      solidABC = track(solidAB.intersect(prismC))
+    }
+    // `solid` は solidAB / solidABC いずれかへの**別名**であり新規 Wasm
+    // オブジェクトではない — 解放は finally の個別変数でのみ行う
+    const solid: Manifold = solidABC ?? solidAB
 
     const status = solid.status()
     if (status !== 'NoError') {
@@ -330,7 +408,7 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
 
     // 台座有効時は結合後の立体が出力対象（decompose / volume / getMesh の全て）。
     // `output` は solid / based いずれかへの**別名**であり新規 Wasm オブジェクト
-    // ではない — 解放は finally の個別変数（solid / based）でのみ行う
+    // ではない — 解放は finally の個別変数（solidAB / solidABC / based）でのみ行う
     const output: Manifold = based ?? solid
 
     perf.enter('mesh')
@@ -374,10 +452,11 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
     // `elapsedMs` は return 式の評価で確定済み。ここから先（delete() 掃除）は
     // elapsedMs に入らず、メインスレッドでは往復（transport）に計上される
     perf.enter('cleanup')
-    // 生成の逆順に破棄：parts[]（逆順）→ based → plate → plateBox → solid
-    // → prismB → centeredB → prismA → rawB → rawA → sectionB → sectionA。
-    // decompose() の戻り配列が最も漏れやすい。台座なしの経路では
-    // based / plate / plateBox は null のままで release は no-op
+    // 生成の逆順に破棄：parts[]（逆順）→ based → plate → plateBox → solidABC
+    // → solidAB → prismC → prismB → centeredC → centeredB → prismA → rawC
+    // → rawB → rawA → sectionC → sectionB → sectionA。
+    // decompose() の戻り配列が最も漏れやすい。台座なし・視点 C なしの経路では
+    // 該当変数は null のままで release は no-op
     if (parts !== null) {
       for (let i = parts.length - 1; i >= 0; i--) {
         release(parts[i])
@@ -386,12 +465,17 @@ export function performCsg(wasm: ManifoldToplevel, request: CsgRequest): CsgResp
     release(based)
     release(plate)
     release(plateBox)
-    release(solid)
+    release(solidABC)
+    release(solidAB)
+    release(prismC)
     release(prismB)
+    release(centeredC)
     release(centeredB)
     release(prismA)
+    release(rawC)
     release(rawB)
     release(rawA)
+    release(sectionC)
     release(sectionB)
     release(sectionA)
     perf.close()

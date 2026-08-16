@@ -211,6 +211,16 @@ describe('geometry/preflight', () => {
     expect(warningOf(report, 'LIKELY_DISCONNECTED')).toBeUndefined()
   })
 
+  it('THIN_NECK の閾値は共通高さ基準で、2 視点の判定は視点 C を足す前と同じ', () => {
+    // 「視点を足しても 2 視点の結果は変わらない」を仮定ではなく検証する。
+    // c を渡さない呼び出しは、レポートのすべてのフィールドが従来どおり
+    const a = [rect(-1, 0, 1, 6), rect(-1, 8, 1, 10)]
+    const b = [rect(-2, 0, 2, 10)]
+    const withoutC = runPreflight(a, b)
+    const explicitNull = runPreflight(a, b, { c: null })
+    expect(explicitNull).toEqual(withoutC)
+  })
+
   it('細すぎる首は THIN_NECK を推定として報告する', () => {
     // A: 幅 0.1 の縦棒。共通高さ 10 の 2%（= 0.2）を下回る
     const a = [rect(-0.05, 0, 0.05, 10)]
@@ -225,5 +235,138 @@ describe('geometry/preflight', () => {
 
     expect(report.ok).toBe(false)
     expect(report.emptyBands).toHaveLength(0)
+  })
+})
+
+/**
+ * 視点 C（FR-101）。
+ *
+ * 座標の対応（protocol.ts `VIEWPOINT_AXES`）を毎回思い出さずに読めるよう、
+ * ここで一度だけ書いておく。`w = −z` と置くと
+ *
+ * - A の被覆 `A_y` … world X（= u）の区間集合
+ * - B の被覆 `B_y` … B の断面ローカル X = **world w** の区間集合
+ * - C のシルエット `S_C` … **(u, w) 平面**の図形。高さ y には依存しない
+ *
+ * 高さ y が立体になるのは `∃w( w ∈ B_y ∧ C_w ∩ A_y ≠ ∅ )` のときだけ。
+ * つまり C は「B が許す奥行きのどこかに、A と重なる材料を持つ」必要がある。
+ */
+describe('geometry/preflight — 視点 C（FR-101）', () => {
+  /** A: 全高の縦棒（world X で ±1） */
+  const fullA = (): Contour[] => [rect(-1, 0, 1, 10)]
+  /** B: 全高の縦棒（world w で ±1） */
+  const fullB = (): Contour[] => [rect(-1, 0, 1, 10)]
+
+  it('3 つとも噛み合う組は警告なしで ok になり、live 帯が全高になる', () => {
+    // C は (u, w) = ([-1,1], [-1,1]) を覆うので、B が許す w（±1）のどこでも
+    // A（±1）と重なる
+    const c = [rect(-1, -1, 1, 1)]
+    const report = runPreflight(fullA(), fullB(), { c })
+
+    expect(report.ok).toBe(true)
+    expect(report.warnings).toHaveLength(0)
+    expect(report.emptyBands).toHaveLength(0)
+    expect(report.estimatedComponents).toBe(1)
+    expect(report.liveYRange).not.toBeNull()
+    expect(report.liveYRange![0]).toBeLessThan(0.1)
+    expect(report.liveYRange![1]).toBeGreaterThan(9.9)
+  })
+
+  it('C が共通帯のどこにも材料を持たない三つ組は EMPTY_INTERSECTION で C を名指しする', () => {
+    // C の材料は w ∈ [5, 7] にしかない。B が許す w は ±1 なので、どの高さでも
+    // スライスは空 — 「失敗した」ではなく「C が空だ」と言えなければならない
+    const c = [rect(-1, 5, 1, 7)]
+    const report = runPreflight(fullA(), fullB(), { c })
+
+    expect(report.ok).toBe(false)
+    expect(report.sharedYRange).toBeNull()
+    expect(report.liveYRange).toBeNull()
+    expect(report.emptyBands).toHaveLength(0)
+    expect(report.warnings).toHaveLength(1)
+
+    const warning = warningOf(report, 'EMPTY_INTERSECTION')
+    expect(warning).toBeDefined()
+    expect(warning!.certainty).toBe('exact')
+    // 機械可読な名指し（UI が文言を組み立て直せる）
+    expect(warning!.emptySides).toEqual(['C'])
+    // 文面でも C を名指しし、断定の文体を保つ
+    expect(warning!.message).toContain('シルエット C')
+    expect(warning!.message).toContain('です')
+    expect(warning!.message).not.toContain('可能性')
+  })
+
+  it('C の被覆が A・B と噛み合わない高さ帯は EMPTY_BAND を C として断定する', () => {
+    // B は下半分では w ∈ [0,1]、上半分では w ∈ [2,3] に材料を持つ。
+    // C は w ∈ [0,1] にしか材料がないので、上半分だけスライスが空になる
+    const a = fullA()
+    const b = [rect(0, 0, 1, 5), rect(2, 5, 3, 10)]
+    const c = [rect(-1, 0, 1, 1)]
+
+    // 同じ A・B は 2 視点なら空帯なしで成立する（＝ C が効いていることの対照）
+    const twoViewpoints = runPreflight(a, b)
+    expect(twoViewpoints.emptyBands).toHaveLength(0)
+    expect(warningOf(twoViewpoints, 'EMPTY_INTERSECTION')).toBeUndefined()
+
+    const report = runPreflight(a, b, { c })
+    expect(report.emptyBands).toHaveLength(1)
+    const band = report.emptyBands[0]
+    expect(band.side).toBe('C')
+    // 帯は上半分（y ∈ [5, 10]）。端は走査線 1 本分（10/256）の分解能で捉える
+    const step = 10 / SCANLINE_COUNT
+    expect(band.from).toBeGreaterThanOrEqual(5)
+    expect(Math.abs(band.from - 5)).toBeLessThanOrEqual(step)
+    expect(band.to).toBeLessThanOrEqual(10)
+    expect(Math.abs(band.to - 10)).toBeLessThanOrEqual(step)
+
+    const warning = warningOf(report, 'EMPTY_BAND')
+    expect(warning).toBeDefined()
+    expect(warning!.certainty).toBe('exact')
+    expect(warning!.side).toBe('C')
+    expect(warning!.message).toContain('シルエット C')
+    expect(warning!.message).not.toContain('可能性')
+
+    // 立体になるのは下半分だけ、という事実を liveYRange が持つ
+    expect(report.liveYRange).not.toBeNull()
+    expect(report.liveYRange![1]).toBeLessThanOrEqual(5)
+  })
+
+  it('C は x 方向の食い違いも見る（w は重なるが A と重ならない場合）', () => {
+    // C の材料は u ∈ [5, 7]。w は B と完全に重なるが、A（u ∈ [-1,1]）とは
+    // どの高さでも重ならない。w の重なりだけを見る実装はここで落ちる
+    const c = [rect(5, -1, 7, 1)]
+    const report = runPreflight(fullA(), fullB(), { c })
+
+    expect(report.ok).toBe(false)
+    const warning = warningOf(report, 'EMPTY_INTERSECTION')
+    expect(warning).toBeDefined()
+    expect(warning!.emptySides).toEqual(['C'])
+  })
+
+  it('A が空の高さでは C に責任を付け替えない', () => {
+    // A に隙間（y ∈ (6,8)）がある。そこは A の空帯であって C の空帯ではない
+    const a = [rect(-1, 0, 1, 6), rect(-1, 8, 1, 10)]
+    const c = [rect(-1, -1, 1, 1)]
+    const report = runPreflight(a, fullB(), { c })
+
+    expect(report.emptyBands).toHaveLength(1)
+    expect(report.emptyBands[0].side).toBe('A')
+    const warning = warningOf(report, 'EMPTY_BAND')
+    expect(warning!.side).toBe('A')
+  })
+
+  it('視点 C を足しても、C なしのレポートは 1 バイトも変わらない', () => {
+    // 同じ a・b について「c を渡さない」呼び出しの結果が、C 対応の前と
+    // 同じであること（上の 2 視点テスト群が無改変で通ることと合わせて二重に固定）
+    const a = [rect(-3, 0, -1, 10), rect(1, 0, 3, 10)]
+    const b = [rect(-1, 0, 1, 10)]
+    const bare = runPreflight(a, b)
+    expect(bare.estimatedComponents).toBe(2)
+    expect(warningOf(bare, 'LIKELY_DISCONNECTED')).toBeDefined()
+
+    // C を足すと、同じ組でも判定が変わりうる（適格性が狭まる）
+    const withC = runPreflight(a, b, { c: [rect(-3, -1, 3, 1)] })
+    expect(withC.estimatedComponents).toBe(2)
+    // それでも c を渡さない呼び出しは元のまま
+    expect(runPreflight(a, b)).toEqual(bare)
   })
 })

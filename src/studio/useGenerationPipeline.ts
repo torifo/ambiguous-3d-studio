@@ -61,7 +61,14 @@ import { presetToContours } from '../sources/presets'
 import { svgToContours } from '../sources/svg'
 import { textToContours } from '../sources/text'
 import { CsgWorkerClient, type CsgClientOptions } from '../worker/client'
-import type { CsgRequest } from '../worker/protocol'
+import {
+  computeDepths,
+  DEPTH_MARGIN as PROTOCOL_DEPTH_MARGIN,
+  viewpointCamera,
+  type CsgRequest,
+  type SilhouetteExtent,
+  type ViewpointCamera,
+} from '../worker/protocol'
 import {
   useStudioStore,
   type StudioInput,
@@ -81,12 +88,28 @@ export const WORKING_HEIGHT = 2
 /**
  * 押し出し深さのマージン（design.md「2. 押し出し深さ」）。
  *
- * **`src/worker/csg.worker.ts` の `DEPTH_MARGIN` と常に一致させること**
- * （テストが等値を検証する）。worker から import しないのは、csg.worker.ts が
- * `manifold-3d` と `manifold.wasm?url` をトップレベルで import しており、
- * メインスレッドのバンドルへ Wasm 一式を引き込んでしまうため。
+ * かつては Worker 側と**同じ値を 2 か所に書いて**テストで等値を検証していた。
+ * 現在は `worker/protocol.ts`（依存ゼロ・Wasm を引き込まない）が唯一の定義で、
+ * ここは再輸出。深さの算出式そのものも同じファイルの `computeDepths` に一本化
+ * してあるので、視点 C や斜交軸を足しても算出側と検証側が食い違わない。
+ * csg.worker.ts を import しないのは変わらない — あちらは `manifold-3d` と
+ * `manifold.wasm?url` をトップレベルで読み、メインスレッドのバンドルへ
+ * Wasm 一式を引き込んでしまうため。
  */
-export const DEPTH_MARGIN = 0.02
+export const DEPTH_MARGIN = PROTOCOL_DEPTH_MARGIN
+
+/**
+ * 視点ごとのカメラ規約（design.md「2.1」の一般化）を Wave 5 のシーンへ公開する。
+ * 実体は `worker/protocol.ts` の {@link viewpointCamera}（軸の割り当てと
+ * カメラの置き場所を 1 か所で決めているファイル）。
+ *
+ * - **A**: 位置 `(0, 0, 1)` 方向 / up `(0, 1, 0)`
+ * - **B**: 位置 `(sin φ, 0, cos φ)` 方向 / up `(0, 1, 0)`（φ=90° で従来の +X）
+ * - **C**: 位置 `(0, 1, 0)` 方向（真上）/ up **`(0, 0, -1)`**
+ *
+ * up を取り違えると、寸法は合ったまま**そのシルエットだけ鏡像になる**。
+ */
+export { viewpointCamera, type ViewpointCamera }
 
 /** ジオメトリの外部保持点（ADR-004）。React の `RefObject` と構造互換 */
 export interface GeometryRef {
@@ -286,22 +309,28 @@ export function createGenerationPipeline(
    * epoch 1 つ分の処理：輪郭抽出 → 正規化 → 受理コミット → プリフライト →
    * ゲート → 深さ算出 → Worker リクエスト。
    *
-   * 深さ（FR-011 / design.md「2. 押し出し深さ」「2.1 軸の割り当て」）：
-   * B の断面は XY 平面で作られ、+Z へ押し出した後 Y 軸まわり +90° 回転で
-   * `(x, y, z) → (z, y, −x)`。つまり **B のローカル X（bbox 幅）が world −Z に
-   * 載る**ので、A の角柱（+Z 押し出し）が B を Z 方向に覆うには
-   * `depth_A = width_B × (1 + DEPTH_MARGIN)`。対称に、B の押し出し軸
-   * （ローカル +Z）は world +X に載るので、A を X 方向に覆うには
-   * `depth_B = width_A × (1 + DEPTH_MARGIN)`。どちらも**回転前の bbox の
-   * X 幅**が基準（Worker は同じ式で防御的に検証し、不足を INVALID_INPUT で弾く）。
+   * 深さ（FR-011 / FR-101 / FR-102）は `worker/protocol.ts` の
+   * {@link computeDepths} が**唯一の根拠**。Worker は同じ関数で防御的に検証し、
+   * 不足を INVALID_INPUT で弾く。以前はこの 2 か所に同じ式を手書きしていたが、
+   * 視点 C と斜交軸で式が「相手 bbox の幅」から
+   * `(wB + wA·|cos φ|)/|sin φ|` と `max(…, C の寄与)` に変わるため、
+   * 手書きを 2 本維持すると必ずどちらかが取り残される。
+   *
+   * 視点 C（`input.c === null`）と軸角（既定 90°）に触らない限り、
+   * 組み立てられるリクエストは従来と同一値になる。
    */
   const process = async (epoch: number, input: StudioInput): Promise<void> => {
     let contoursA: Contour[]
     let contoursB: Contour[]
+    // 初期値を置かない：try で必ず代入され、catch は return する。
+    // `= null` を置くと「使われない代入」になる（no-useless-assignment）
+    let contoursC: Contour[] | null
     try {
-      const [rawA, rawB] = await Promise.all([
+      const [rawA, rawB, rawC] = await Promise.all([
         resolveSource(input.a),
         resolveSource(input.b),
+        // 視点 C は任意。null のときは解決も正規化も行わない
+        input.c === null ? Promise.resolve(null) : resolveSource(input.c),
       ])
       // dispose 済みのパイプラインは計測に触らない。StrictMode の二重マウントでは
       // 破棄済みパイプラインの process() が後から解決し、**新しいパイプラインの
@@ -310,6 +339,9 @@ export function createGenerationPipeline(
       if (!disposed) stage('normalize')
       contoursA = normalizeSilhouette(rawA, WORKING_HEIGHT).contours
       contoursB = normalizeSilhouette(rawB, WORKING_HEIGHT).contours
+      // C も共通高さ H へ合わせる。C の断面ローカル Y は world −Z に載るので
+      // （protocol.ts `VIEWPOINT_AXES`）、この「高さ」は立体の奥行きになる
+      contoursC = rawC === null ? null : normalizeSilhouette(rawC, WORKING_HEIGHT).contours
     } catch {
       // 解析・正規化の失敗 = 入力の拒否（FR-006）。受理コミットの**前**なので
       // 拒否された入力が復帰先になることはない（トラップ 3）。拒否が届く前に
@@ -331,8 +363,8 @@ export function createGenerationPipeline(
     store.getState().inputAccepted(epoch)
 
     stage('preflight')
-    const report = runPreflight(contoursA, contoursB)
-    store.getState().setWarnings(epoch, report.warnings)
+    const report = runPreflight(contoursA, contoursB, { c: contoursC })
+    store.getState().setWarnings(epoch, report.warnings, report.liveYRange)
 
     // 生成のゲートは EMPTY_INTERSECTION の有無**のみ**（トラップ 1）。
     // `report.ok` は「警告ゼロ」であり、EMPTY_BAND があっても生成は実行する
@@ -352,18 +384,39 @@ export function createGenerationPipeline(
       return
     }
 
-    const boundsA = boundsOf(contoursA)
-    const boundsB = boundsOf(contoursB)
+    const extentOf = (contours: Contour[]): SilhouetteExtent => {
+      const b = boundsOf(contours)
+      return { width: b.maxX - b.minX, height: b.maxY - b.minY }
+    }
+    let depths: ReturnType<typeof computeDepths>
+    try {
+      depths = computeDepths({
+        a: extentOf(contoursA),
+        b: extentOf(contoursB),
+        c: contoursC === null ? null : extentOf(contoursC),
+        axisAngleDeg: input.axisAngleDeg,
+      })
+    } catch (err) {
+      // 深さが算出できない入力（軸角が範囲外・寸法が縮退）は生成しない。
+      // Worker へ送っても同じ理由で弾かれるだけなので、ここで終端させる
+      abandonRun('depth-rule-rejected')
+      const settledEpoch = acquire()
+      if (settledEpoch !== null) {
+        store
+          .getState()
+          .generationFailed(settledEpoch, { code: 'INVALID_INPUT', detail: messageOf(err) })
+      }
+      return
+    }
     dispatchAllowed = true
     client.requestGeneration({
-      a: {
-        contours: contoursA,
-        depth: (boundsB.maxX - boundsB.minX) * (1 + DEPTH_MARGIN),
-      },
-      b: {
-        contours: contoursB,
-        depth: (boundsA.maxX - boundsA.minX) * (1 + DEPTH_MARGIN),
-      },
+      a: { contours: contoursA, depth: depths.a },
+      b: { contours: contoursB, depth: depths.b },
+      c:
+        contoursC === null || depths.c === null
+          ? null
+          : { contours: contoursC, depth: depths.c },
+      axisAngleDeg: input.axisAngleDeg,
       baseplate: baseplateFor(store.getState().options),
     })
   }

@@ -5,14 +5,23 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { StoreApi } from 'zustand/vanilla'
 import {
+  clampAxisAngleDeg,
   createStudioStore,
   INITIAL_INPUT,
   selectCanExport,
   selectIsErrorState,
+  selectIsOrthogonalAxes,
+  selectViewpointCount,
   type GenerationSummary,
   type StudioState,
 } from './useStudioStore'
-import type { PreflightWarning, SilhouetteSource } from '../geometry/types'
+import type { ViewpointPreflightWarning } from '../geometry/preflight'
+import type { SilhouetteSource } from '../geometry/types'
+import {
+  DEFAULT_AXIS_ANGLE_DEG,
+  MAX_AXIS_ANGLE_DEG,
+  MIN_AXIS_ANGLE_DEG,
+} from '../worker/protocol'
 
 const star: SilhouetteSource = { kind: 'preset', id: 'star' }
 const heart: SilhouetteSource = { kind: 'preset', id: 'heart' }
@@ -29,11 +38,12 @@ const summary: GenerationSummary = {
   elapsedMs: 180,
 }
 
-const emptyBandWarning: PreflightWarning = {
+const emptyBandWarning: ViewpointPreflightWarning = {
   code: 'EMPTY_BAND',
   certainty: 'exact',
   message: 'この高さで立体が途切れます',
   band: [0.4, 0.6],
+  side: 'A',
 }
 
 let store: StoreApi<StudioState>
@@ -308,10 +318,9 @@ describe('FR-006 — リセットと直前入力の復帰', () => {
 
     // パイプラインが受理を通知して初めて昇格する
     store.getState().inputAccepted(store.getState().generationEpoch)
-    expect(store.getState().lastValidInput).toEqual({
-      a: star,
-      b: INITIAL_INPUT.b,
-    })
+    // 初期値からの差分だけを書く（視点 C・軸角のような追加フィールドが増えても
+    // 「A だけ差し替わった」という主張が壊れない）
+    expect(store.getState().lastValidInput).toEqual({ ...INITIAL_INPUT, a: star })
   })
 
   it('SVG 拒否 → restoreLastValidInput() で直前の受理済み入力に戻る', () => {
@@ -366,7 +375,7 @@ describe('FR-006 — リセットと直前入力の復帰', () => {
     // 4. 遅れて届いた拒否（stale epoch）による復帰は無視される —
     //    最新の編集（badSvg × heart の検証待ち）を上書きしない
     store.getState().restoreLastValidInput(validatingEpoch)
-    expect(store.getState().input).toEqual({ a: badSvg, b: heart })
+    expect(store.getState().input).toEqual({ ...INITIAL_INPUT, a: badSvg, b: heart })
 
     // 最新 epoch での拒否 → 受理済みの square × circle へ復帰。
     // 不正 SVG が復元されることは決してない
@@ -425,6 +434,118 @@ describe('オプション', () => {
   })
 })
 
+describe('視点 C と軸角（FR-101 / FR-102）', () => {
+  beforeEach(() => {
+    store.getState().wasmReady()
+  })
+
+  it('初期状態は 2 視点・直交（従来と同じ入力）', () => {
+    const s = store.getState()
+    expect(s.input.c).toBeNull()
+    expect(s.input.axisAngleDeg).toBe(DEFAULT_AXIS_ANGLE_DEG)
+    expect(selectViewpointCount(s)).toBe(2)
+    expect(selectIsOrthogonalAxes(s)).toBe(true)
+  })
+
+  it('setSilhouetteC で 3 視点になり、null で 2 視点へ完全に戻る', () => {
+    generateSuccessfully(store)
+    store.getState().setSilhouetteC(star)
+    expect(selectViewpointCount(store.getState())).toBe(3)
+    // 入力変更なので直前の結果は破棄される（US-001）
+    expect(store.getState().lastResult).toBeNull()
+    expect(selectCanExport(store.getState())).toBe(false)
+
+    generateSuccessfully(store)
+    store.getState().setSilhouetteC(null)
+    expect(selectViewpointCount(store.getState())).toBe(2)
+    // 外した後の入力は、C を一度も使わなかった状態と等しい
+    expect(store.getState().input).toEqual(INITIAL_INPUT)
+  })
+
+  it('setAxisAngleDeg は 15〜165° へ丸め、入力変更として結果を破棄する', () => {
+    expect(clampAxisAngleDeg(45)).toBe(45)
+    expect(clampAxisAngleDeg(0)).toBe(MIN_AXIS_ANGLE_DEG)
+    expect(clampAxisAngleDeg(200)).toBe(MAX_AXIS_ANGLE_DEG)
+    expect(clampAxisAngleDeg(Number.NaN)).toBe(DEFAULT_AXIS_ANGLE_DEG)
+
+    generateSuccessfully(store)
+    store.getState().setAxisAngleDeg(45)
+    expect(store.getState().input.axisAngleDeg).toBe(45)
+    expect(selectIsOrthogonalAxes(store.getState())).toBe(false)
+    expect(store.getState().lastResult).toBeNull()
+
+    store.getState().setAxisAngleDeg(1000)
+    expect(store.getState().input.axisAngleDeg).toBe(MAX_AXIS_ANGLE_DEG)
+  })
+
+  it('視点 A/B の差し替えは C と軸角を保持する', () => {
+    store.getState().setSilhouetteC(star)
+    store.getState().setAxisAngleDeg(45)
+    store.getState().setSilhouetteA(heart)
+    const s = store.getState()
+    expect(s.input.a).toEqual(heart)
+    expect(s.input.c).toEqual(star)
+    expect(s.input.axisAngleDeg).toBe(45)
+  })
+
+  it('applyInput は入力一式を 1 トランザクションで差し替える（epoch は 1 回だけ進む）', () => {
+    const before = store.getState().generationEpoch
+    store.getState().applyInput({ a: star, b: heart, c: star, axisAngleDeg: 45 })
+    const s = store.getState()
+    expect(s.generationEpoch).toBe(before + 1)
+    expect(s.input).toEqual({ a: star, b: heart, c: star, axisAngleDeg: 45 })
+    expect(selectViewpointCount(s)).toBe(3)
+  })
+
+  it('applyInput の省略フィールドは既定（C なし・直交）に落ちる', () => {
+    store.getState().applyInput({ a: star, b: heart, c: star, axisAngleDeg: 45 })
+    // カタログの 2 視点エントリを適用したら、C と斜交は必ず解除される
+    store.getState().applyInput({ a: heart, b: star })
+    expect(store.getState().input).toEqual({
+      a: heart,
+      b: star,
+      c: null,
+      axisAngleDeg: DEFAULT_AXIS_ANGLE_DEG,
+    })
+  })
+
+  it('applyInput の軸角も範囲へ丸める', () => {
+    store.getState().applyInput({ a: star, b: heart, axisAngleDeg: -30 })
+    expect(store.getState().input.axisAngleDeg).toBe(MIN_AXIS_ANGLE_DEG)
+  })
+
+  it('resetShapes は C と軸角も初期値へ戻す（FR-006）', () => {
+    store.getState().applyInput({ a: star, b: heart, c: star, axisAngleDeg: 45 })
+    store.getState().resetShapes()
+    expect(store.getState().input).toEqual(INITIAL_INPUT)
+    expect(selectViewpointCount(store.getState())).toBe(2)
+  })
+
+  it('C を含む入力も 1 段の復帰（lastValidInput）で丸ごと巻き戻る', () => {
+    store.getState().applyInput({ a: star, b: heart, c: star, axisAngleDeg: 45 })
+    store.getState().inputAccepted(store.getState().generationEpoch)
+
+    store.getState().setSilhouetteC(badSvg)
+    store.getState().restoreLastValidInput(store.getState().generationEpoch)
+    expect(store.getState().input).toEqual({ a: star, b: heart, c: star, axisAngleDeg: 45 })
+  })
+
+  it('視点 C の空帯警告は側を機械可読に持つ', () => {
+    const warning: ViewpointPreflightWarning = {
+      code: 'EMPTY_BAND',
+      certainty: 'exact',
+      message: 'C に材料がありません',
+      band: [0.1, 0.3],
+      side: 'C',
+    }
+    store.getState().setWarnings(store.getState().generationEpoch, [warning])
+    const stored = store.getState().warnings[0]
+    expect(stored.code).toBe('EMPTY_BAND')
+    if (stored.code !== 'EMPTY_BAND') return
+    expect(stored.side).toBe('C')
+  })
+})
+
 describe('警告と結果メタデータ', () => {
   it('setWarnings が警告リストを差し替える（現在の epoch なら反映）', () => {
     store.getState().setWarnings(store.getState().generationEpoch, [
@@ -432,6 +553,20 @@ describe('警告と結果メタデータ', () => {
     ])
     expect(store.getState().warnings).toHaveLength(1)
     expect(store.getState().warnings[0]!.code).toBe('EMPTY_BAND')
+  })
+
+  it('setWarnings は live 帯（FR-101）も同じトランザクションで反映し、入力変更で捨てる', () => {
+    const epoch = store.getState().generationEpoch
+    store.getState().setWarnings(epoch, [emptyBandWarning], [-0.4, 0.8])
+    expect(store.getState().liveYRange).toEqual([-0.4, 0.8])
+
+    // live 帯を渡さない呼び出しは「知らない」であって「据え置き」ではない
+    store.getState().setWarnings(store.getState().generationEpoch, [])
+    expect(store.getState().liveYRange).toBeNull()
+
+    store.getState().setWarnings(store.getState().generationEpoch, [], [0, 1])
+    store.getState().setSilhouetteA(star)
+    expect(store.getState().liveYRange).toBeNull()
   })
 
   it('成功時のメタデータに geometry を含まない（ADR-004）', () => {

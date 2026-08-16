@@ -58,8 +58,14 @@
 import { create } from 'zustand'
 import { createStore } from 'zustand/vanilla'
 import type { StateCreator, StoreApi } from 'zustand/vanilla'
-import type { PreflightWarning, SilhouetteSource } from '../geometry/types'
-import type { CsgError } from '../worker/protocol'
+import type { ViewpointPreflightWarning } from '../geometry/preflight'
+import type { SilhouetteSource } from '../geometry/types'
+import {
+  DEFAULT_AXIS_ANGLE_DEG,
+  MAX_AXIS_ANGLE_DEG,
+  MIN_AXIS_ANGLE_DEG,
+  type CsgError,
+} from '../worker/protocol'
 import { clampHeightMm, DEFAULT_HEIGHT_MM } from '../studio/scale'
 
 /** FR-025 の状態機械。`loading-wasm` はエラーではなく正常系 */
@@ -71,10 +77,43 @@ export type StudioStatus =
   | 'error'
   | 'init-failed'
 
-/** 視点 A / B の入力ペア。履歴（1 段）もこの単位でスナップショットする */
+/**
+ * 生成入力の全量。履歴（1 段）もこの単位でスナップショットする。
+ *
+ * **視点 C と軸角は「オプション」ではなく入力の一部**として扱う（FR-101 /
+ * FR-102）：どちらも CSG の結果そのものを変えるので、変更は入力変更として
+ * epoch を進め、直前の生成結果を破棄しなければならない。台座（options 側）と
+ * 違って指紋監視の対象にしていないのはこのため。
+ */
 export interface StudioInput {
   a: SilhouetteSource
   b: SilhouetteSource
+  /** 視点 C（FR-101）。**null = 2 視点**で、従来と同じ `M = M_A ∩ M_B` */
+  c: SilhouetteSource | null
+  /**
+   * 視点 B の押し出し軸角（度、XZ 平面内。FR-102）。
+   * **90 = 直交**が既定で、従来と 1 ビットも変わらない経路を通る。
+   */
+  axisAngleDeg: number
+}
+
+/**
+ * カタログ項目などから入力一式を差し替えるときの指定（FR-100 / FR-103）。
+ * `illusion-catalogue.md` の `IllusionEntry['preset']` と同じ形なので、
+ * カタログのエントリをそのまま {@link StudioState.applyInput} に渡せる。
+ * 省略したフィールドは既定（C なし・直交 90°）になる。
+ */
+export interface StudioInputSpec {
+  a: SilhouetteSource
+  b: SilhouetteSource
+  c?: SilhouetteSource | null
+  axisAngleDeg?: number
+}
+
+/** FR-102 の軸角の範囲へ丸める。非有限は既定（90°）に落とす */
+export function clampAxisAngleDeg(deg: number): number {
+  if (!Number.isFinite(deg)) return DEFAULT_AXIS_ANGLE_DEG
+  return Math.min(MAX_AXIS_ANGLE_DEG, Math.max(MIN_AXIS_ANGLE_DEG, deg))
 }
 
 /** 生成オプション。台座の厚みは FR-015（既定 2.0mm、0.5〜5.0mm） */
@@ -108,6 +147,8 @@ export const DEFAULT_BASEPLATE_MM = 2.0
 export const INITIAL_INPUT: StudioInput = {
   a: { kind: 'preset', id: 'square' },
   b: { kind: 'preset', id: 'circle' },
+  c: null,
+  axisAngleDeg: DEFAULT_AXIS_ANGLE_DEG,
 }
 
 export interface StudioState {
@@ -137,8 +178,19 @@ export interface StudioState {
   options: StudioOptions
 
   // ---- 生成結果 ----
-  /** プリフライト・生成由来の警告（FR-012）。入力変更で破棄される */
-  warnings: PreflightWarning[]
+  /**
+   * プリフライト・生成由来の警告（FR-012 / FR-101）。入力変更で破棄される。
+   * 型は視点名（`EMPTY_BAND.side` / `EMPTY_INTERSECTION.emptySides`）を**足した**
+   * 版で、コードの集合は `PreflightWarning` と同一 — 追加フィールドを読まない
+   * 既存 UI はそのまま動く（geometry/preflight.ts の型解説を参照）。
+   */
+  warnings: ViewpointPreflightWarning[]
+  /**
+   * **すべての視点が同時に材料を持つ高さ帯**（FR-101 が提示を求めるもの）。
+   * 立体になるのはこの範囲だけで、2 視点でも 3 視点でも意味は同じ。
+   * プリフライト前・空交差・入力変更直後は null。
+   */
+  liveYRange: [number, number] | null
   /** 直近の成功した生成のメタデータ。geometry 本体は ref 保持（ADR-004） */
   lastResult: GenerationSummary | null
 
@@ -170,7 +222,25 @@ export interface StudioState {
   // いずれも「入力変更」であり、同じ set() の中で直前の生成結果を破棄する
   setSilhouetteA: (source: SilhouetteSource) => void
   setSilhouetteB: (source: SilhouetteSource) => void
-  /** FR-006: 視点 A / B を初期値（正方形 × 円）に戻す */
+  /**
+   * FR-101: 視点 C の入力。**null で第 3 の視点を外す**（2 視点に戻る）。
+   * 外した瞬間の結果は、視点 C を一度も使わなかった場合と完全に同じになる。
+   */
+  setSilhouetteC: (source: SilhouetteSource | null) => void
+  /**
+   * FR-102: 視点 B の押し出し軸角（度）。
+   * {@link clampAxisAngleDeg} で 15〜165° に丸める。90 = 直交（既定）。
+   */
+  setAxisAngleDeg: (deg: number) => void
+  /**
+   * FR-100 / FR-103: 入力一式を **1 トランザクションで**差し替える。
+   * カタログ項目の適用はこれを使うこと — a / b / c を個別に設定すると
+   * epoch が 3 回進み、中間状態（C だけ差し替わった不整合な組）でも
+   * 解析とプリフライトが走ってしまう。
+   * 省略したフィールドは既定（`c: null` / `axisAngleDeg: 90`）に落ちる。
+   */
+  applyInput: (spec: StudioInputSpec) => void
+  /** FR-006: 視点を初期値（正方形 × 円・C なし・直交）に戻す */
   resetShapes: () => void
   /**
    * 現在の入力が解析・正規化を通過した（= 受理された）ことの通知。
@@ -199,11 +269,18 @@ export interface StudioState {
 
   // ---- 警告 ----
   /**
-   * 警告リストの差し替え。`epoch` は警告の算出を始めた時点の世代。
-   * 不一致（stale なプリフライト結果）は無視する — 古い入力の警告が
-   * 最新の入力の警告として表示されることはない。
+   * プリフライト結果の反映（警告リストと live 帯の差し替え）。
+   * `epoch` は算出を始めた時点の世代。不一致（stale なプリフライト結果）は
+   * 無視する — 古い入力の警告が最新の入力の警告として表示されることはない。
+   *
+   * `liveYRange` を省略した呼び出しは「live 帯を知らない」ことを意味し、
+   * null に落とす（古い帯を残さない）。
    */
-  setWarnings: (epoch: number, warnings: PreflightWarning[]) => void
+  setWarnings: (
+    epoch: number,
+    warnings: ViewpointPreflightWarning[],
+    liveYRange?: [number, number] | null,
+  ) => void
 }
 
 /**
@@ -251,7 +328,8 @@ function invalidateForInputChange(s: StudioState): Partial<StudioState> {
   const base = {
     generationEpoch: s.generationEpoch + 1,
     lastResult: null,
-    warnings: [] as PreflightWarning[],
+    warnings: [] as ViewpointPreflightWarning[],
+    liveYRange: null,
   }
   if (s.status === 'success' || s.status === 'error') {
     return { ...base, status: 'ready' as const, lastError: null }
@@ -271,6 +349,7 @@ const studioStateCreator: StateCreator<StudioState> = (set, get) => ({
     heightMm: DEFAULT_HEIGHT_MM,
   },
   warnings: [],
+  liveYRange: null,
   lastResult: null,
 
   wasmReady: () => {
@@ -328,13 +407,36 @@ const studioStateCreator: StateCreator<StudioState> = (set, get) => ({
   setSilhouetteA: (source) =>
     set((s) => ({
       ...invalidateForInputChange(s),
-      input: { a: source, b: s.input.b },
+      input: { ...s.input, a: source },
     })),
 
   setSilhouetteB: (source) =>
     set((s) => ({
       ...invalidateForInputChange(s),
-      input: { a: s.input.a, b: source },
+      input: { ...s.input, b: source },
+    })),
+
+  setSilhouetteC: (source) =>
+    set((s) => ({
+      ...invalidateForInputChange(s),
+      input: { ...s.input, c: source },
+    })),
+
+  setAxisAngleDeg: (deg) =>
+    set((s) => ({
+      ...invalidateForInputChange(s),
+      input: { ...s.input, axisAngleDeg: clampAxisAngleDeg(deg) },
+    })),
+
+  applyInput: (spec) =>
+    set((s) => ({
+      ...invalidateForInputChange(s),
+      input: {
+        a: spec.a,
+        b: spec.b,
+        c: spec.c ?? null,
+        axisAngleDeg: clampAxisAngleDeg(spec.axisAngleDeg ?? DEFAULT_AXIS_ANGLE_DEG),
+      },
     })),
 
   resetShapes: () =>
@@ -389,10 +491,10 @@ const studioStateCreator: StateCreator<StudioState> = (set, get) => ({
   setHeightMm: (mm) =>
     set((s) => ({ options: { ...s.options, heightMm: clampHeightMm(mm) } })),
 
-  setWarnings: (epoch, warnings) => {
+  setWarnings: (epoch, warnings, liveYRange = null) => {
     // stale なプリフライト結果（算出開始後に入力が変わった）は無視する
     if (epoch !== get().generationEpoch) return
-    set({ warnings })
+    set({ warnings, liveYRange })
   },
 })
 
@@ -426,4 +528,14 @@ export function selectCanExport(state: StudioState): boolean {
  */
 export function selectIsErrorState(state: StudioState): boolean {
   return state.status === 'error' || state.status === 'init-failed'
+}
+
+/** 現在有効な視点の数（FR-101）。2 = 従来、3 = 視点 C あり */
+export function selectViewpointCount(state: StudioState): 2 | 3 {
+  return state.input.c === null ? 2 : 3
+}
+
+/** 押し出し軸が直交しているか（FR-102）。false なら斜交（カメラ規約が回る） */
+export function selectIsOrthogonalAxes(state: StudioState): boolean {
+  return state.input.axisAngleDeg === DEFAULT_AXIS_ANGLE_DEG
 }
