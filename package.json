@@ -8,7 +8,9 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "build:e2e": "VITE_ENABLE_PERF=true VITE_ENABLE_AR=false vite build",
+    "e2e": "playwright test"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.8",
@@ -23,6 +25,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4.3.3",
     "@types/node": "^26.2.0",
     "@types/opentype.js": "^1.3.10",
