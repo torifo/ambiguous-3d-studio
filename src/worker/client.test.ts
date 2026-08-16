@@ -5,13 +5,13 @@
  * 進める。実時間では 1ms も眠らない。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { CsgRequest, CsgResponse } from './protocol'
+import type { CsgError, CsgRequest, CsgResponse } from './protocol'
 import {
+  CsgClientDisposedError,
   CsgWorkerClient,
   DEFAULT_DEBOUNCE_MS,
   DEFAULT_INIT_TIMEOUT_MS,
   WARMUP_GENERATION,
-  type CsgClientError,
   type CsgClientHandlers,
   type CsgSuccess,
   type GenerationPayload,
@@ -60,7 +60,7 @@ interface Harness {
   /** onReady / acquireEpoch の呼び出し順の記録 */
   calls: string[]
   successes: Array<{ epoch: number; result: CsgSuccess }>
-  errors: Array<{ epoch: number; error: CsgClientError }>
+  errors: Array<{ epoch: number; error: CsgError }>
   initFailures: string[]
 }
 
@@ -185,6 +185,21 @@ describe('起動と Wasm 先読み（NFR-003）', () => {
     expect(h.client.initState).toBe('init-failed')
     expect(h.initFailures).toEqual(['wasm fetch 404'])
     expect(h.errors).toHaveLength(0) // 生成中ではないので epoch 向けの通知はない
+  })
+
+  it('初期化中の失敗応答（WASM_INIT_FAILED 以外）を正常起動と誤認しない', () => {
+    const h = makeHarness()
+    // エンジン異常でウォームアップの失敗が INVALID_INPUT に分類されたケース。
+    // 「応答が返せた」は初期化完了の証明にならない——成功応答だけが証明になる
+    h.workers[0].emitResponse({
+      generation: WARMUP_GENERATION,
+      ok: false,
+      error: { code: 'INVALID_INPUT', detail: 'engine fault' },
+    })
+    expect(h.client.initState).toBe('init-failed')
+    expect(h.calls).not.toContain('onReady')
+    expect(h.initFailures).toHaveLength(1)
+    expect(h.initFailures[0]).toContain('INVALID_INPUT')
   })
 })
 
@@ -329,6 +344,39 @@ describe('世代 ID と stale 破棄（US-001）', () => {
     })
     expect(h.errors).toHaveLength(0)
   })
+
+  it('新しい入力の受理後は、デバウンス窓の間に届いた旧世代のレスポンスを配達しない', () => {
+    const h = makeHarness()
+    h.workers[0].emitReady()
+    const r1 = dispatch(h, h.workers[0], 1) // 世代 1 が in flight
+    // 入力変更：世代 2 はまだ 120ms のデバウンス窓の中（未ディスパッチ）
+    h.client.requestGeneration(trianglePayload(2))
+    // 窓の間に世代 1 の応答が届く。受理の時点で追い越されているので破棄——
+    // ディスパッチまで無効化を遅らせると、この応答が「最新」として配達される
+    h.workers[0].emitResponse(okResponse(r1.generation, 100))
+    expect(h.successes).toHaveLength(0)
+    // 窓が明けて世代 2 がディスパッチされ、その結果だけが配達される
+    vi.advanceTimersByTime(DEFAULT_DEBOUNCE_MS)
+    const r2 = h.workers[0].requests[1]
+    h.workers[0].emitResponse(okResponse(r2.generation, 200))
+    expect(h.successes).toHaveLength(1)
+    expect(h.successes[0].result.positions[0]).toBe(200)
+  })
+
+  it('追い越された世代は、窓の中でクラッシュしても再試行されない', () => {
+    const h = makeHarness()
+    h.workers[0].emitReady()
+    dispatch(h, h.workers[0], 1) // 世代 1 が in flight
+    h.client.requestGeneration(trianglePayload(2)) // 窓の中で追い越す
+    h.workers[0].emitCrash()
+    h.workers[1].emitReady()
+    // 追い越し済みの世代 1 は再試行しない（結果はどのみち破棄されるだけ）
+    expect(h.workers[1].requests).toHaveLength(0)
+    // 窓が明ければ最新の入力だけがディスパッチされる
+    vi.advanceTimersByTime(DEFAULT_DEBOUNCE_MS)
+    expect(h.workers[1].requests).toHaveLength(1)
+    expect(h.workers[1].requests[0].a.depth).toBe(2)
+  })
 })
 
 describe('クラッシュ回復', () => {
@@ -375,7 +423,7 @@ describe('クラッシュ回復', () => {
     expect(h.workers[2].requests).toHaveLength(0)
   })
 
-  it('作り直した Worker が初期化前に死んだ場合もエラーで終端し、ループしない', () => {
+  it('作り直した Worker が初期化前に死んでも onInitFailed の単一通知で、ループしない', () => {
     const h = makeHarness()
     h.workers[0].emitReady()
     dispatch(h, h.workers[0], 5)
@@ -384,12 +432,35 @@ describe('クラッシュ回復', () => {
     h.workers[1].emitCrash() // ready 前に死んだ → 初期化失敗として扱う
     expect(h.client.initState).toBe('init-failed')
     expect(h.initFailures).toHaveLength(1)
-    // 実行中だった生成もエラーで終端する（スピナーが止まる）
-    expect(h.errors).toHaveLength(1)
-    expect(h.errors[0].epoch).toBe(1)
-    expect(h.errors[0].error.code).toBe('WASM_INIT_FAILED')
+    // 実行中だった生成を onError（generationFailed）として先に流してはならない：
+    // store が error に落ち、続く wasmInitFailed が no-op になって回復不能になる。
+    // 終端は onInitFailed の 1 回だけ（store は generating → init-failed を許容する）
+    expect(h.errors).toHaveLength(0)
     // 3 台目は勝手に作らない（復帰は retryInit 経由のみ）
     expect(h.workers).toHaveLength(2)
+  })
+
+  it('生成中のクラッシュ → 代替 Worker の初期化失敗でも回復経路が残る（BLOCKER 再現）', () => {
+    const h = makeHarness()
+    h.workers[0].emitReady()
+    dispatch(h, h.workers[0], 5) // epoch 1 の生成が in flight
+    h.workers[0].emitCrash() // 代替 Worker が立つ
+    expect(h.workers).toHaveLength(2)
+
+    // 代替 Worker の Wasm 初期化が 10 秒以内に完了しない
+    vi.advanceTimersByTime(DEFAULT_INIT_TIMEOUT_MS)
+    expect(h.client.initState).toBe('init-failed')
+    // インフラの初期化失敗は単一の終端通知（onInitFailed）に一本化される
+    expect(h.initFailures).toHaveLength(1)
+    expect(h.errors).toHaveLength(0)
+
+    // 中断された payload は失われず、retryInit → ready 後に
+    // 新しい epoch を取り直して再送出される（誰も永久に待たない）
+    h.client.retryInit()
+    h.workers[2].emitReady()
+    expect(h.workers[2].requests).toHaveLength(1)
+    expect(h.workers[2].requests[0].a.depth).toBe(5)
+    expect(h.calls.filter((c) => c === 'acquireEpoch')).toHaveLength(2)
   })
 
   it('アイドル中のクラッシュは作り直すだけで、誤ったエラー通知をしない', () => {
@@ -457,6 +528,54 @@ describe('成功応答', () => {
   })
 })
 
+describe('同期的な起動失敗（FR-025 経路への回収）', () => {
+  /** onInitFailed の記録だけを持つ最小ハンドラ（makeHarness は使えない — 生成自体を検証する） */
+  function bareHandlers(initFailures: string[]): CsgClientHandlers {
+    return {
+      acquireEpoch: () => null,
+      onSuccess: () => {},
+      onError: () => {},
+      onInitFailed: (d) => initFailures.push(d),
+    }
+  }
+
+  it('createWorker が throw してもコンストラクタは throw せず init-failed で報告する', async () => {
+    const initFailures: string[] = []
+    let client!: CsgWorkerClient
+    expect(() => {
+      client = new CsgWorkerClient(bareHandlers(initFailures), {
+        createWorker: () => {
+          throw new Error('SecurityError: CSP により Worker がブロックされた')
+        },
+      })
+    }).not.toThrow()
+    expect(client.initState).toBe('init-failed')
+    expect(initFailures).toHaveLength(1)
+    expect(initFailures[0]).toContain('CSP')
+    await expect(client.whenReady()).rejects.toThrow(/CSP/)
+  })
+
+  it('初回 postMessage が同期的に throw しても init-failed 経路に落ちる', async () => {
+    const initFailures: string[] = []
+    let client!: CsgWorkerClient
+    expect(() => {
+      client = new CsgWorkerClient(bareHandlers(initFailures), {
+        createWorker: () => {
+          const w = new MockWorker()
+          w.postMessage = () => {
+            throw new Error('DataCloneError')
+          }
+          return w
+        },
+      })
+    }).not.toThrow()
+    expect(client.initState).toBe('init-failed')
+    expect(initFailures).toHaveLength(1)
+    expect(initFailures[0]).toContain('DataCloneError')
+    await expect(client.whenReady()).rejects.toThrow(/DataCloneError/)
+  })
+})
+
 describe('dispose', () => {
   it('破棄後はタイマーもリクエストも動かない', () => {
     const h = makeHarness()
@@ -466,5 +585,20 @@ describe('dispose', () => {
     expect(h.workers[0].terminated).toBe(true)
     vi.advanceTimersByTime(DEFAULT_DEBOUNCE_MS * 2)
     expect(h.workers[0].requests).toHaveLength(0)
+  })
+
+  it('dispose すると未解決の whenReady は CsgClientDisposedError で reject する', async () => {
+    const h = makeHarness()
+    const ready = h.client.whenReady() // まだ ready 信号は届いていない
+    h.client.dispose()
+    await expect(ready).rejects.toBeInstanceOf(CsgClientDisposedError)
+  })
+
+  it('ready 到達後の dispose は解決済みの whenReady を巻き戻さない', async () => {
+    const h = makeHarness()
+    h.workers[0].emitReady()
+    const ready = h.client.whenReady()
+    h.client.dispose()
+    await expect(ready).resolves.toBeUndefined()
   })
 })

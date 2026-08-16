@@ -6,16 +6,23 @@
  *   瞬間に Worker が立ち上がり、Wasm 初期化（100〜300ms）がユーザーの初回
  *   操作の外側で始まる。準備状態は `initState` / `whenReady()` で公開する
  * - **初期化の 10 秒タイムアウト → init-failed（FR-025）**。ハングではなく
- *   「失敗＋再試行（`retryInit`）」として提示する
+ *   「失敗＋再試行（`retryInit`）」として提示する。`new Worker()` や初回
+ *   postMessage の**同期例外**（CSP による SecurityError 等）も同じ
+ *   init-failed 経路に流す — コンストラクタは決して throw しない
  * - **生成リクエストの 120ms デバウンス（NFR-004）**。打鍵ごとに CSG を
  *   1 回ずつ積まず、最新の 1 件だけを送る
  * - **単調増加する世代 ID と stale 破棄**。Wasm のブール演算は途中キャンセル
  *   できないため、追い越されたリクエストも最後まで走ってレスポンスを返す。
- *   `generation === latestGeneration` でないレスポンスを破棄することが、
- *   古いメッシュが新しい結果を上書きするのを防ぐ唯一の機構（protocol.ts 冒頭）
+ *   古いレスポンスは受信側で破棄する（protocol.ts 冒頭）。破棄の判定は
+ *   ディスパッチ時ではなく**新しい入力を受理した瞬間**に効き始める：
+ *   `requestGeneration()` が新しい payload を受理した時点で実行中の世代を
+ *   無効化する。さもないとデバウンス窓の 120ms の間に届いた旧世代の
+ *   レスポンスが「最新」として配達されてしまう
  * - **クラッシュ回復**。Worker が死んだら（error / messageerror）作り直し、
- *   実行中だったリクエストを**ちょうど 1 回だけ**再試行する。2 度目の失敗は
- *   エラーとして表面化し、ループしない
+ *   実行中だったリクエストを**ちょうど 1 回だけ**再試行する。2 度目の
+ *   クラッシュはエラー（`WORKER_CRASHED`）として表面化し、ループしない。
+ *   作り直した Worker の**初期化が失敗した**場合は生成エラーではなく
+ *   `onInitFailed` の単一通知に一本化する（下記「初期化失敗の一本化」）
  *
  * ## store の epoch との噛み合わせ（useStudioStore.ts のパイプライン契約）
  *
@@ -46,33 +53,55 @@
  *     geometryRef.current = toBufferGeometry(r) // ref 保持は studio/ の責務
  *     useStudioStore.getState().generationSucceeded(epoch, summarize(r))
  *   },
- *   onError: (epoch, e) => useStudioStore.getState().generationFailed(epoch, toCsgError(e)),
+ *   onError: (epoch, e) => useStudioStore.getState().generationFailed(epoch, e),
  *   onReady: () => useStudioStore.getState().wasmReady(),
  *   onInitFailed: (d) => useStudioStore.getState().wasmInitFailed(d),
  * })
  * ```
  *
- * ## 初期化ハンドシェイク（protocol.ts に未定義のため、ここで契約を固定する）
+ * ## 初期化失敗の一本化（onInitFailed が唯一の終端通知）
  *
- * protocol.ts は CsgRequest / CsgResponse のみを定義し、初期化完了の通知形が
- * ない。そこでクライアントは Worker 生成直後に**世代 0 のウォームアップ
- * リクエスト**（`WARMUP_GENERATION`。極小の正方形どうし）を送る。世代 0 は
- * 実際の生成には決して使わないため、応答は結果としては常に破棄されるが、
- * 「応答が返せた＝Wasm 初期化が完了した」ことの証明になる。これにより、
- * リクエスト応答しかしない Worker 実装（現行の csg.worker.ts）とも、
- * ready を自発送信する実装とも噛み合う。受け付ける初期化の合図：
- * - `{ type: 'ready' }` — 初期化成功の自発通知（`WorkerLifecycleMessage`）
- * - 任意の有効な CsgResponse — 受信は初期化完了を含意する
- *   （ウォームアップ応答がこの経路で ready を確立する）
- * - `{ type: 'init-failed', detail }`、または初期化中に届いた `ok: false`
- *   かつ `WASM_INIT_FAILED` の CsgResponse — 初期化失敗
- * - 初期化完了前の Worker `error` イベント — 初期化失敗
+ * インフラの初期化失敗（起動時・retryInit 時・クラッシュ回復中の再初期化を
+ * 問わず）は、**常に `onInitFailed` の 1 回だけ**で通知する。生成の実行中
+ * だったとしても `onError`（= store の `generationFailed`）は流さない。
  *
- * ウォームアップは NFR-003 の先読みも兼ねる：Worker が初期化を遅延実行する
- * 実装でも、世代 0 の要求が Wasm 初期化と最初の CSG パスをアプリ起動時に
- * 引き起こす。
+ * かつては「生成エラーとしても終端させる」ために onError → onInitFailed の
+ * 順で両方を呼んでいたが、これは store を先に `error` へ落とし、続く
+ * `wasmInitFailed` を no-op にしてしまう——クライアントは init-failed、
+ * store は error、そして store の `retryInit()` は error からは動かないため
+ * **回復不能**になる。store は現在 `generating → init-failed` を許容する
+ * ので、初期化失敗はそのまま init-failed として正直に報告できる。実行中
+ * だった payload は破棄せず pending に戻し（FR-025: 入力は保持）、
+ * `retryInit()` → ready 到達後に新しい epoch で再送出される。
+ *
+ * ## 初期化ハンドシェイク（protocol.ts の `WorkerLifecycleMessage`）
+ *
+ * 準備完了の判定は Worker が自発送信する `{ type: 'ready' }`
+ * （`WorkerLifecycleMessage`。`isLifecycleMessage()` で判別）を**正**とする。
+ * クライアントは Worker 生成直後に世代 0 のウォームアップリクエスト
+ * （`WARMUP_GENERATION`。極小の正方形どうし）も送る — これは NFR-003 の
+ * 先読み（Wasm 初期化と最初の CSG パスをアプリ起動時に引き起こす）の
+ * ためで、応答は結果としては常に破棄される。
+ *
+ * ready 信号を送らない Worker 実装への保険として、初期化中に**成功した**
+ * CsgResponse を受信した場合も初期化完了と見なす（成功応答を返せた＝Wasm は
+ * 動いている）。ただし**失敗応答は準備完了の証明にならない**：初期化中の
+ * `ok: false` は WASM_INIT_FAILED に限らず初期化失敗として扱う。エンジン
+ * 異常でウォームアップが INVALID_INPUT / NOT_MANIFOLD に分類されるケースを
+ * 「正常起動」と誤認しないため。受け付ける合図のまとめ：
+ * - `{ type: 'ready' }` — 初期化成功（正規の経路）
+ * - 初期化中の成功 CsgResponse — 初期化完了のフォールバック
+ * - `{ type: 'init-failed', detail }` / 初期化中の失敗 CsgResponse /
+ *   初期化完了前の Worker `error` イベント / spawn 時の同期例外 — 初期化失敗
+ * - どれも届かない — 10 秒タイムアウトが init-failed に落とす
  */
-import type { CsgError, CsgRequest, CsgResponse } from './protocol'
+import {
+  isLifecycleMessage,
+  type CsgError,
+  type CsgRequest,
+  type CsgResponse,
+  type WorkerOutbound,
+} from './protocol'
 
 /** NFR-004: 連続入力を合流させるデバウンス幅 */
 export const DEFAULT_DEBOUNCE_MS = 120
@@ -82,8 +111,8 @@ export const DEFAULT_INIT_TIMEOUT_MS = 10_000
 
 /**
  * ウォームアップリクエストの予約世代。実際の生成は 1 から始まるため衝突
- * しない。この世代への応答は結果としては破棄され、初期化完了の合図として
- * だけ使われる（ファイル冒頭「初期化ハンドシェイク」を参照）。
+ * しない。この世代への応答は結果としては破棄され、初期化完了のフォール
+ * バック合図としてだけ使われる（ファイル冒頭「初期化ハンドシェイク」を参照）。
  */
 export const WARMUP_GENERATION = 0
 
@@ -94,26 +123,15 @@ export type GenerationPayload = Omit<CsgRequest, 'generation'>
 export type CsgSuccess = Omit<Extract<CsgResponse, { ok: true }>, 'generation' | 'ok'>
 
 /**
- * Worker のクラッシュ由来の失敗。protocol.ts の `CsgError` には該当コードが
- * 存在しないため、クライアント層で拡張する。store の `generationFailed` は
- * `CsgError` を要求するので、Wave 4 はこのコードを適宜マップすること。
+ * dispose() による準備待ちの中断。dispose 時点で未解決の `whenReady()` は
+ * このエラーで reject する（永久 pending にしない）。
  */
-export interface WorkerCrashError {
-  code: 'WORKER_CRASHED'
-  detail: string
+export class CsgClientDisposedError extends Error {
+  constructor() {
+    super('CsgWorkerClient は dispose() 済みです')
+    this.name = 'CsgClientDisposedError'
+  }
 }
-
-/** `onError` に届きうる失敗の全体（Worker 内の失敗 ∪ クラッシュ） */
-export type CsgClientError = CsgError | WorkerCrashError
-
-/**
- * Worker → メインスレッドの初期化ハンドシェイク。protocol.ts に未定義の
- * ため、client がここで契約を固定する（ファイル冒頭の解説を参照）。
- * csg.worker.ts は初期化の成否をこの形で 1 回だけ post することが望ましい。
- */
-export type WorkerLifecycleMessage =
-  | { type: 'ready' }
-  | { type: 'init-failed'; detail: string }
 
 /** 初期化の進行状態。FR-025 の loading-wasm / ready / init-failed に対応する */
 export type CsgClientInitState = 'initializing' | 'ready' | 'init-failed'
@@ -141,13 +159,18 @@ export interface CsgClientHandlers {
   /** 最新世代の生成が成功した。`epoch` は acquireEpoch が返した値そのもの */
   onSuccess: (epoch: number, result: CsgSuccess) => void
   /**
-   * 最新世代の生成が失敗した（Worker 内エラー / 2 度目のクラッシュ /
-   * 再試行中の再初期化失敗）。`epoch` は acquireEpoch が返した値そのもの
+   * 最新世代の生成が失敗した（Worker 内エラー / 2 度目のクラッシュ）。
+   * `epoch` は acquireEpoch が返した値そのもの。インフラの初期化失敗は
+   * ここには**流れず**、`onInitFailed` に一本化される（ファイル冒頭
+   * 「初期化失敗の一本化」を参照）
    */
-  onError: (epoch: number, error: CsgClientError) => void
+  onError: (epoch: number, error: CsgError) => void
   /** Wasm 初期化完了。`wasmReady` を渡す。Worker 再生成後にも呼ばれうる（store 側は no-op） */
   onReady?: () => void
-  /** 初期化失敗 / 10 秒タイムアウト。`wasmInitFailed` を渡す */
+  /**
+   * 初期化失敗 / 10 秒タイムアウト / クラッシュ回復中の再初期化失敗。
+   * `wasmInitFailed` を渡す（store はどの状態からでも init-failed を受ける）
+   */
   onInitFailed?: (detail: string) => void
 }
 
@@ -188,16 +211,23 @@ interface InFlightRequest {
   retriesLeft: number
 }
 
-function isLifecycleMessage(data: unknown): data is WorkerLifecycleMessage {
-  if (typeof data !== 'object' || data === null) return false
-  const type = (data as { type?: unknown }).type
-  return type === 'ready' || type === 'init-failed'
-}
-
 function isCsgResponse(data: unknown): data is CsgResponse {
   if (typeof data !== 'object' || data === null) return false
   const d = data as { generation?: unknown; ok?: unknown }
   return typeof d.generation === 'number' && typeof d.ok === 'boolean'
+}
+
+/** 同期例外（unknown）を init-failed の detail 文字列に変換する */
+function causeDetail(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause)
+}
+
+/** 初期化中に受信した失敗レスポンスを init-failed の detail に変換する */
+function warmupFailureDetail(error: CsgError): string {
+  if (error.code === 'WASM_INIT_FAILED') return error.detail
+  return 'detail' in error
+    ? `ウォームアップ生成が失敗しました（${error.code}）: ${error.detail}`
+    : `ウォームアップ生成が失敗しました（${error.code}）`
 }
 
 /**
@@ -241,7 +271,9 @@ export class CsgWorkerClient {
 
   /**
    * 生成した瞬間に Worker が起動し、Wasm 初期化が始まる（NFR-003 の先読み）。
-   * アプリ起動時に 1 度だけ生成し、常設すること。
+   * アプリ起動時に 1 度だけ生成し、常設すること。Worker の起動が同期的に
+   * 失敗しても throw せず、`onInitFailed` / `whenReady()` の reject で
+   * 報告する（FR-025 の再試行 UI に必ず到達させる）。
    */
   constructor(handlers: CsgClientHandlers, options: CsgClientOptions = {}) {
     this.handlers = handlers
@@ -257,8 +289,9 @@ export class CsgWorkerClient {
   }
 
   /**
-   * 現在の初期化サイクルの完了を待つ。初期化失敗 / タイムアウトで reject する。
-   * `retryInit()` 後は新しい Promise になるため、再取得すること。
+   * 現在の初期化サイクルの完了を待つ。初期化失敗 / タイムアウトで reject し、
+   * `dispose()` 時は `CsgClientDisposedError` で reject する（永久 pending に
+   * しない）。`retryInit()` 後は新しい Promise になるため、再取得すること。
    */
   whenReady(): Promise<void> {
     return this.readyPromise
@@ -269,9 +302,17 @@ export class CsgWorkerClient {
    * 窓が延長され、**最新の 1 件だけ**が Worker に届く（NFR-004）。
    * ready 前 / init-failed 中の発行は破棄せず保持し、ready 到達時に送出する
    * （FR-025: 入力は受け付けて保持する、の Worker 側対応）。
+   *
+   * 受理した瞬間に、実行中の世代を無効化する：以後その応答は届いても
+   * 配達せず、クラッシュしても再試行しない。ディスパッチ（デバウンス満了）
+   * まで無効化を遅らせると、120ms の窓の間に届いた旧世代のレスポンスが
+   * 「最新」として配達されてしまう。
    */
   requestGeneration(payload: GenerationPayload): void {
     if (this.disposed) return
+    // 新しい入力の受理＝実行中の生成の supersede。演算自体は中断できないが
+    // （protocol.ts 冒頭）、結果の採用と再試行はこの時点で打ち切る
+    this.inFlight = null
     this.pending = payload
     this.pendingElapsed = false
     if (this.debounceTimer !== null) clearTimeout(this.debounceTimer)
@@ -288,7 +329,8 @@ export class CsgWorkerClient {
 
   /**
    * init-failed からの再試行（FR-025）。store 側の `retryInit()` と併せて
-   * 呼ぶこと。保持中の pending リクエストは ready 到達後に送出される。
+   * 呼ぶこと。保持中の pending リクエスト（初期化失敗時に中断された生成の
+   * payload を含む）は ready 到達後に送出される。
    */
   retryInit(): void {
     if (this.disposed) return
@@ -312,6 +354,9 @@ export class CsgWorkerClient {
     this.worker = null
     this.pending = null
     this.inFlight = null
+    // 未解決の whenReady() を永久 pending にしない。すでに解決済みの
+    // Promise に対しては no-op
+    this.readyReject(new CsgClientDisposedError())
   }
 
   // ---- 内部 ----
@@ -325,7 +370,16 @@ export class CsgWorkerClient {
     // 誰も await していなくても unhandled rejection にしない
     this.readyPromise.catch(() => {})
 
-    const w = this.createWorker()
+    let w: WorkerLike
+    try {
+      w = this.createWorker()
+    } catch (cause) {
+      // new Worker() の同期失敗（CSP の SecurityError 等）。throw を呼び出し元へ
+      // 逃さず、FR-025 の init-failed 経路（onInitFailed / whenReady reject）に流す
+      this.worker = null
+      this.handleInitFailure(`Worker を起動できませんでした: ${causeDetail(cause)}`)
+      return
+    }
     this.worker = w
     // 差し替え済み（クラッシュで作り直した後の旧 Worker）からの遅延イベントは
     // すべて無視する — `this.worker !== w` のガードがその境界
@@ -348,29 +402,43 @@ export class CsgWorkerClient {
       )
     }, this.initTimeoutMs)
 
-    // 初期化ハンドシェイク：世代 0 のウォームアップを送る。応答が返れば
-    // 初期化完了、WASM_INIT_FAILED が返れば失敗、何も返らなければ上の
-    // タイムアウトが init-failed に落とす（ファイル冒頭の解説を参照）
-    w.postMessage(warmupRequest())
+    // 初期化ハンドシェイク：世代 0 のウォームアップを送る（NFR-003 の先読み）。
+    // ready の判定は lifecycle メッセージが正で、成功応答はフォールバック。
+    // 何も返らなければ上のタイムアウトが init-failed に落とす
+    try {
+      w.postMessage(warmupRequest())
+    } catch (cause) {
+      // postMessage の同期失敗も同じ init-failed 経路へ（コンストラクタ・
+      // retryInit から throw を逃さない）
+      this.handleInitFailure(
+        `ウォームアップの送信に失敗しました: ${causeDetail(cause)}`,
+      )
+    }
   }
 
   private handleMessage(data: unknown): void {
     if (this.disposed) return
-    if (isLifecycleMessage(data)) {
-      if (data.type === 'ready') this.handleWorkerReady()
-      else this.handleInitFailure(data.detail)
+    if (typeof data !== 'object' || data === null) return
+    const message = data as WorkerOutbound
+    if (isLifecycleMessage(message)) {
+      if (message.type === 'ready') this.handleWorkerReady()
+      else if (message.type === 'init-failed') this.handleInitFailure(message.detail)
       return
     }
-    if (!isCsgResponse(data)) return // 未知のメッセージは無視
+    if (!isCsgResponse(message)) return // 未知のメッセージは無視
     if (this.state === 'initializing') {
-      if (!data.ok && data.error.code === 'WASM_INIT_FAILED') {
-        this.handleInitFailure(data.error.detail)
+      if (!message.ok) {
+        // 失敗応答は準備完了の証明にならない。エンジン異常でウォームアップが
+        // INVALID_INPUT 等に分類されても「正常起動」とは扱わず、初期化失敗
+        // として提示する（復帰は retryInit 経由）
+        this.handleInitFailure(warmupFailureDetail(message.error))
         return
       }
-      // レスポンスを返せている＝初期化は完了している（ready 信号欠落への保険）
+      // 成功応答を返せている＝初期化は完了している（ready 信号を送らない
+      // Worker 実装へのフォールバック）
       this.handleWorkerReady()
     }
-    this.handleResponse(data)
+    this.handleResponse(message)
   }
 
   private handleWorkerReady(): void {
@@ -386,14 +454,16 @@ export class CsgWorkerClient {
     this.handlers.onReady?.()
 
     if (this.pending !== null && this.pendingElapsed) {
-      // デバウンス満了済みの新しい入力が待っている。クラッシュ再試行より
-      // 優先する（再試行しても新しい世代に追い越されて stale になるだけ）
+      // デバウンス満了済みの新しい入力が待っている。この場合 inFlight は
+      // requestGeneration の受理時点で無効化済み（supersede）
       this.inFlight = null
       this.dispatchPending()
       return
     }
     if (this.inFlight !== null && this.worker !== null) {
-      // クラッシュ再試行：epoch も世代 ID も取り直さない（同一の生成の続き）
+      // クラッシュ再試行：epoch も世代 ID も取り直さない（同一の生成の続き）。
+      // 追い越された生成はここに到達しない（requestGeneration が受理時に
+      // inFlight を無効化するため）
       this.worker.postMessage({
         ...this.inFlight.payload,
         generation: this.inFlight.generation,
@@ -420,10 +490,11 @@ export class CsgWorkerClient {
   }
 
   private handleResponse(response: CsgResponse): void {
-    // stale 破棄（US-001 / NFR-004）：最新世代でないレスポンスは成否に
-    // かかわらず採用しない。Wasm 演算はキャンセルできないため追い越された
-    // 演算も完走してレスポンスを返すが、古いメッシュが新しい結果を
-    // 上書きする経路はここで断つ
+    // stale 破棄（US-001 / NFR-004）：最新世代でない、または supersede で
+    // 無効化済み（inFlight から外れた）レスポンスは成否にかかわらず採用
+    // しない。Wasm 演算はキャンセルできないため追い越された演算も完走して
+    // レスポンスを返すが、古いメッシュが新しい結果を上書きする経路は
+    // ここで断つ
     if (response.generation !== this.latestGeneration) return
     const inFlight = this.inFlight
     if (inFlight === null || inFlight.generation !== response.generation) return
@@ -480,13 +551,16 @@ export class CsgWorkerClient {
 
     const inFlight = this.inFlight
     if (inFlight !== null) {
-      // クラッシュ再試行中の再初期化失敗など。生成としても終端させ、
-      // スピナーを止める（store は generating → error で受ける）
+      // クラッシュ再試行中の再初期化失敗など。インフラの初期化失敗は
+      // onInitFailed の**単一通知**に一本化する（ファイル冒頭「初期化失敗の
+      // 一本化」— onError を先に流すと store が error に落ち、init-failed へ
+      // 遷移できず回復不能になる）。中断された payload は pending に戻し、
+      // retryInit → ready 後に新しい epoch で再送出する（FR-025: 入力は保持）。
+      // 注: inFlight が生きている間 pending は常に null（requestGeneration が
+      // 受理時に inFlight を無効化するため）なので、新しい入力を潰す心配はない
       this.inFlight = null
-      this.handlers.onError(inFlight.epoch, {
-        code: 'WASM_INIT_FAILED',
-        detail,
-      })
+      this.pending = inFlight.payload
+      this.pendingElapsed = true
     }
     this.readyReject(new Error(detail))
     this.handlers.onInitFailed?.(detail)
