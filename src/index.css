@@ -1,6 +1,63 @@
 @import 'tailwindcss';
 
 /*
+ * デザイントークン（見た目の改善パス。内容・構成は変えず「見え方」だけを底上げする）。
+ *
+ * 参照: ~/dev/design/art-gallery/digital（"digital" ペルソナのアートギャラリー
+ * デザインスタディ）。"the code is the work" という前提が、生成した幾何を
+ * 「作品」として並べるこのアプリの成り立ちと一致するため、他のスタディより
+ * こちらを選んだ。true black × off-white × electric green、ターミナル的な
+ * 等幅表記、固定 HUD、という語彙をそのまま借りる。
+ *
+ * ただし 2 点はこのアプリの制約に合わせて作り直す（コピーではなく適応）。
+ *
+ * 1) NFR-030「外部送信ゼロ」— e2e (network-isolation.spec.ts) が実際に
+ *    origin 外へのリクエストが 0 件であることを検証する。参照は Google Fonts
+ *    の CDN から JetBrains Mono / Space Grotesk / Inter を取得しているが、
+ *    それは持ち込めない。ここでは OS 同梱のシステムフォントスタックで代替する。
+ *    `public/fonts/Inter-Regular.otf` は SVG/テキストのグリフ抽出専用に
+ *    すでに同梱されているが、UI 表示フォントとしては採用しない — 追加の
+ *    @font-face を増やすことがこのタスクの本題ではなく、システムスタックで
+ *    十分に「等幅×可変幅」の 2 層は表現できるため。
+ *
+ *    等幅スタックは**ラテン文字のみのトークン**（原題 originalName・製品名・
+ *    視点記号 A/B/C・数値）に用途を絞る。一般的な等幅フォント（SF Mono や
+ *    Menlo）は CJK グリフを持たず、和文混じりの文に適用すると 1 文字ごとに
+ *    フォールバック先の等幅 CJK フォント（環境によっては MS ゴシック相当の
+ *    ビットマップ調）へ割れてガタつく。カテゴリ名や現象・機構の説明文など
+ *    和文本体は `--font-sans` のまま統一する。
+ *
+ * 2) NFR-002「60fps 予算」— frame-pacing.spec.ts がカメラ回転中 10 秒間の
+ *    フレーム間隔 P95 < 16.7ms・ロングタスク 0 件を検証する。参照は
+ *    WebGL/Canvas2D の粒子フィールドを毎フレーム再描画する背景を持つが、
+ *    このアプリでは 3D ビューポート自体がすでに R3F の描画予算を使っている
+ *    ため、別のアニメーション背景を足すと予算を奪い合う。ここでは
+ *    「ジェネラティブな質感」をアニメーションなしの静的な CSS
+ *    background-image（グリッド + ビネット、初回ペイントのみ）で代替する。
+ *    JS も requestAnimationFrame も使わず、しかも WebGL の Canvas とは
+ *    別の DOM 領域（サイドバー / ボトムシート）にしか置かない — 3D
+ *    ビューポートの合成レイヤーと重ならないため、フレーム予算に触れない。
+ */
+@theme {
+  --color-ink: #000000;
+  --color-ink-raised: #0a0a0a;
+  --color-ink-card: #101010;
+  --color-line: #1f1f1f;
+  --color-line-soft: #151515;
+  --color-paper: #e7e5e0;
+  --color-muted: #8a8a86;
+  --color-faint: #46443f;
+  --color-accent: #00ff88;
+
+  --font-mono:
+    ui-monospace, 'SF Mono', 'Cascadia Code', 'Roboto Mono', Menlo, Consolas, 'Liberation Mono',
+    monospace;
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Hiragino Kaku Gothic ProN', 'Hiragino Sans',
+    'Yu Gothic Medium', 'Segoe UI', Roboto, 'Noto Sans JP', 'Helvetica Neue', Arial, sans-serif;
+}
+
+/*
  * モバイルの土台（Task 7.1 / FR-026 / NFR-021）。
  *
  * アプリシェル（App.tsx）は `h-dvh` の 1 画面で、ページ自体はスクロール
@@ -34,6 +91,18 @@
   body {
     margin: 0;
     -webkit-text-size-adjust: 100%;
+    background: var(--color-ink);
+    color: var(--color-paper);
+    font-family: var(--font-sans);
+    /* 数値の桁が動く箇所（ms・cm³・mm・角度）を等幅に揃える。フォント切替では
+       なく OpenType の tnum フィーチャーなので和文と混在しても破綻しない */
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection {
+    background: var(--color-accent);
+    color: var(--color-ink);
   }
 }
 
@@ -46,4 +115,30 @@
   padding-left: max(1rem, env(safe-area-inset-left));
   padding-right: max(1rem, env(safe-area-inset-right));
   padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+
+/*
+ * 「ジェネラティブな質感」の静的な代替（上のコメント参照）。アニメーションを
+ * 一切使わず、初回ペイントだけで済む background-image のみで構成する。
+ * WebGL の Canvas を持つ要素には絶対に使わないこと — 3D ビューポートの
+ * フレーム予算（NFR-002）とは無関係な DOM 領域専用。
+ */
+@utility hud-texture {
+  background-color: var(--color-ink);
+  background-image:
+    radial-gradient(ellipse 120% 60% at 0% 0%, rgba(0, 255, 136, 0.05), transparent 60%),
+    repeating-linear-gradient(
+      0deg,
+      rgba(231, 229, 224, 0.035) 0,
+      rgba(231, 229, 224, 0.035) 1px,
+      transparent 1px,
+      transparent 28px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      rgba(231, 229, 224, 0.035) 0,
+      rgba(231, 229, 224, 0.035) 1px,
+      transparent 1px,
+      transparent 28px
+    );
 }

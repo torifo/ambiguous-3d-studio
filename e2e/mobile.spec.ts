@@ -10,7 +10,7 @@ import { switchToFreeMode, waitForGenerationSuccess } from './helpers'
  * 3D ビューポートが画面の過半を占め、ビューポート上の 1 本指ドラッグが
  * ページスクロールを起こさないことを検証する。
  *
- * ## 「自由に組み合わせる」モードでドラッグを試す理由
+ * ## 「自由に作る」モードでドラッグを試す理由
  *
  * 既定のカタログモードは `scene/SweetSpot.ts` の `useViewerStore` 初期値が
  * `curatedMode: true` / `rotationLocked: true` — 「常に回転できるとすぐに

@@ -114,34 +114,53 @@ export function findAppliedEntryId(input: StudioInput): string | null {
   return null
 }
 
-/** カタログ。App.tsx はこれを `<Gallery />` として置くだけでよい（必須 props なし） */
+/**
+ * カタログ。App.tsx はこれを `<Gallery />` として置くだけでよい（必須 props なし）。
+ *
+ * 見た目の改修（Task: 見え方の改善パス）。生成できる/できないの内訳
+ * （5 件 / 7 件）を冒頭で数字として見せる — owner が「使いどころがある」と
+ * 挙げた、この方式で作れるものと作れないものの実在の区別を、読む前から
+ * 提示するため。ロジック（selectedId の導出・カードの並び）は変えていない。
+ */
 export function Gallery() {
   const applyInput = useStudioStore((s) => s.applyInput)
   const input = useStudioStore((s) => s.input)
   const selectedId = useMemo(() => findAppliedEntryId(input), [input])
+  const buildableCount = ILLUSIONS.filter(isBuildableIllusion).length
 
   const handleSelect = (entry: IllusionEntry): void => {
     applyIllusionSelection(entry, applyInput)
   }
 
   return (
-    <div className="pad-safe flex h-full flex-col gap-3 overflow-y-auto overscroll-contain pt-2">
+    <div className="pad-safe flex h-full flex-col gap-4 overflow-y-auto overscroll-contain pt-2">
       <div>
         {/* Ambiguous 3D Studio という製品名の <h1> は App.tsx のシェルへ集約した
             （3 モード共通の 1 つの見出しにするため）。ここは 2 段目の見出し */}
-        <h2 className="text-sm font-semibold tracking-wide text-neutral-100">錯視立体カタログ</h2>
-        <p className="mt-1 text-[11px] text-neutral-500">
+        <p aria-hidden="true" className="flex items-center gap-1 font-mono text-[10px] tracking-[0.16em] text-accent">
+          <span>&gt;</span> catalogue
+        </p>
+        <h2 className="mt-1 text-base font-semibold tracking-tight text-paper">錯視立体カタログ</h2>
+        <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
           既知の錯視立体を選ぶと、その錯視を再現する入力が設定され、右のビューポートに立体が生成されます。
           この方式では作れないものも、境界を示すために掲載しています。
         </p>
+        {/* text-faint はコントラスト比が低い（#46443f on #000 ≈ 1.9:1）ため、
+            実テキストには使わない — axe の color-contrast 違反ゼロを崩さないよう
+            text-muted（AA 相当）に留める */}
+        <p className="mt-2 text-[11px] tracking-wide text-muted">
+          生成できる {buildableCount} 件<span className="mx-1.5 text-muted/60">/</span>
+          境界を示す {ILLUSIONS.length - buildableCount} 件
+        </p>
       </div>
-      <ul className="flex flex-col gap-2">
-        {ILLUSIONS.map((entry) => (
+      <ul className="flex flex-col gap-3">
+        {ILLUSIONS.map((entry, i) => (
           <li key={entry.id}>
             <IllusionCard
               entry={entry}
               selected={selectedId === entry.id}
               onSelect={() => handleSelect(entry)}
+              index={i + 1}
             />
           </li>
         ))}

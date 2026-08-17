@@ -117,10 +117,10 @@ function describeError(error: CsgError, viewpointCount: 2 | 3): Copy {
 function WarningItem(props: { copy: WarningCopy }) {
   const { copy } = props
   return (
-    <li className="rounded border border-neutral-700 p-2 text-xs">
-      <p className="font-medium text-neutral-200">
+    <li className="border border-line p-2 text-xs">
+      <p className="font-medium text-paper">
         <span
-          className={`mr-1.5 inline-block rounded border border-current px-1 align-middle text-[10px] ${
+          className={`mr-1.5 inline-block border border-current px-1 align-middle text-[10px] ${
             copy.badge === '確定' ? 'text-sky-300' : 'text-amber-300'
           }`}
         >
@@ -128,7 +128,7 @@ function WarningItem(props: { copy: WarningCopy }) {
         </span>
         {copy.title}
       </p>
-      <p className="mt-1 text-neutral-400">{copy.body}</p>
+      <p className="mt-1 text-muted">{copy.body}</p>
     </li>
   )
 }
@@ -156,8 +156,7 @@ export function StatusBanner(props: StatusBannerProps) {
 
   // EMPTY_RESULT は性質の提示なので中立の枠、それ以外の失敗は注意の枠。
   // 枠の色は補助であり、区別の実体は見出しと本文のテキストが担う
-  const errorTone =
-    lastError?.code === 'EMPTY_RESULT' ? 'border-neutral-700' : 'border-amber-400/60'
+  const errorTone = lastError?.code === 'EMPTY_RESULT' ? 'border-line' : 'border-amber-400/60'
 
   // FR-014: decompose() による確定値。推定（LIKELY_DISCONNECTED）と違い断定で書く
   const splitNote =
@@ -182,7 +181,7 @@ export function StatusBanner(props: StatusBannerProps) {
           {status === 'error' && errorCopy !== null ? errorCopy.title : STATUS_LABELS[status]}
         </p>
         {status === 'success' && lastResult !== null && (
-          <p className="mt-0.5 text-[11px] text-neutral-500">
+          <p className="mt-0.5 text-[11px] text-muted">
             パーツ {lastResult.componentCount} ・ 三角形 {lastResult.triangleCount} ・ 体積 約
             {volumeCm3}cm³ ・ {Math.round(lastResult.elapsedMs)}ms
           </p>
@@ -191,28 +190,24 @@ export function StatusBanner(props: StatusBannerProps) {
             3 視点でも意味は同じだが、3 視点では 2 視点よりずっと狭くなりうるため
             常に mm で提示する（store.liveYRange の doc を参照） */}
         {liveRangeText !== null && (
-          <p className="mt-0.5 text-[11px] text-neutral-500">{liveRangeText}</p>
+          <p className="mt-0.5 text-[11px] text-muted">{liveRangeText}</p>
         )}
         {status === 'error' && errorCopy !== null && (
-          <p className={`mt-1 rounded border p-2 text-neutral-300 ${errorTone}`}>
-            {errorCopy.body}
-          </p>
+          <p className={`mt-1 border p-2 text-neutral-300 ${errorTone}`}>{errorCopy.body}</p>
         )}
       </div>
 
       {/* FR-025: init-failed は再試行手段を添えて提示する */}
       {status === 'init-failed' && (
-        <div role="alert" className="rounded border border-red-400/60 p-2 text-xs">
-          <p className="font-medium text-neutral-100">
-            {errorCopy?.title ?? STATUS_LABELS['init-failed']}
-          </p>
+        <div role="alert" className="border border-red-400/60 p-2 text-xs">
+          <p className="font-medium text-paper">{errorCopy?.title ?? STATUS_LABELS['init-failed']}</p>
           <p className="mt-1 text-neutral-300">
             {errorCopy?.body ?? '再試行するか、ブラウザを最新版に更新してください。'}
           </p>
           <button
             type="button"
             onClick={retry}
-            className="mt-2 min-h-11 w-full rounded border border-neutral-500 px-3 text-xs text-neutral-100 hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
+            className="mt-2 min-h-11 w-full border border-line px-3 text-xs text-paper hover:border-neutral-500 hover:bg-ink-card focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
           >
             再試行
           </button>
@@ -223,9 +218,7 @@ export function StatusBanner(props: StatusBannerProps) {
       <section aria-live="polite" aria-label="この組み合わせの性質">
         {(warnings.length > 0 || splitNote !== null) && (
           <>
-            <h2 className="mb-1.5 text-xs font-semibold text-neutral-200">
-              この組み合わせの性質
-            </h2>
+            <h2 className="mb-1.5 text-xs font-semibold text-paper">この組み合わせの性質</h2>
             <ul className="flex flex-col gap-1.5">
               {splitNote !== null && <WarningItem copy={splitNote} />}
               {warnings.map((warning, index) => (

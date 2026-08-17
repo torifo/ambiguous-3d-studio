@@ -38,12 +38,12 @@ export const PRESET_LABELS: Record<Nfr001Shape, string> = {
 }
 
 /**
- * 「自由に組み合わせる」モードへ切り替える。SilhouettePicker と ExportPanel は
+ * 「自由に作る」モードへ切り替える。SilhouettePicker と ExportPanel は
  * このモード（ui/Sidebar.tsx）でしかマウントされない（App.tsx: mode === 'free'
  * のときだけ <Sidebar /> を描画する）。
  */
 export async function switchToFreeMode(page: Page): Promise<void> {
-  await page.getByRole('tab', { name: '自由に組み合わせる' }).click()
+  await page.getByRole('tab', { name: '自由に作る' }).click()
   // タブ切り替え直後は Sidebar がまだマウントされていないことがあるため、
   // 固定 sleep ではなく中の見出しが実際に現れるまで待つ
   await expect(page.getByRole('heading', { name: /^視点 A/ })).toBeVisible()

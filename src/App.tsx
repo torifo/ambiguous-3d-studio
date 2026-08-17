@@ -55,12 +55,14 @@ import { useCallback, useMemo, useReducer, useRef } from 'react'
 import type { KeyboardEvent } from 'react'
 
 import { Sidebar } from './ui/Sidebar'
-import { Gallery } from './ui/Gallery'
+import { Gallery, findAppliedEntryId } from './ui/Gallery'
 import { PuzzlePanel } from './ui/PuzzlePanel'
 import { StatusBanner } from './ui/StatusBanner'
 import { Viewport } from './scene/Viewport'
 import { useViewerStore, type SnapView } from './scene/SweetSpot'
 import { useGenerationPipeline } from './studio/useGenerationPipeline'
+import { useStudioStore } from './store/useStudioStore'
+import { ILLUSIONS } from './catalogue/illusions'
 import {
   INITIAL_MODE_STATE,
   MODE_LABELS,
@@ -131,7 +133,7 @@ function ModeTabs(props: { mode: StudioMode; onSelect: (mode: StudioMode) => voi
     <div
       role="tablist"
       aria-label="表示モード"
-      className="flex shrink-0 gap-1 border-b border-neutral-800 pt-4 pb-2 pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]"
+      className="flex shrink-0 gap-1 border-b border-line pt-4 pb-2 pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]"
     >
       {STUDIO_MODES.map((m, index) => (
         <button
@@ -150,7 +152,7 @@ function ModeTabs(props: { mode: StudioMode; onSelect: (mode: StudioMode) => voi
           tabIndex={mode === m ? 0 : -1}
           onClick={() => onSelect(m)}
           onKeyDown={(event) => handleKeyDown(event, index)}
-          className="min-h-11 flex-1 rounded border border-neutral-700 px-1.5 text-[11px] text-neutral-400 aria-selected:border-sky-400 aria-selected:bg-sky-400/10 aria-selected:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
+          className="min-h-11 flex-1 border border-line px-1 text-[11px] leading-tight text-muted transition-colors hover:border-neutral-600 hover:text-paper aria-selected:border-sky-400 aria-selected:bg-sky-400/10 aria-selected:text-sky-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400"
         >
           {MODE_LABELS[m]}
         </button>
@@ -180,19 +182,45 @@ function AppHeader(props: { mode: StudioMode; onRetryInit: () => void }) {
   const { mode, onRetryInit } = props
   if (mode === 'free') return null
   return (
-    <div className="shrink-0 border-b border-neutral-800 pt-3 pb-3 pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]">
-      <h1 className="text-sm font-semibold tracking-wide text-neutral-100">Ambiguous 3D Studio</h1>
-      <div className="mt-2">
+    <div className="shrink-0 border-b border-line pt-3 pb-3 pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]">
+      {/* 製品名はラテン文字のみなので等幅にできる（index.css 冒頭の方針）。
+          点は「稼働中」の合図（reference の HUD ドットと同じ語彙）。
+          motion-safe: を使うことで prefers-reduced-motion では自動的に止まる */}
+      <h1 className="flex items-center gap-1.5 font-mono text-xs font-semibold tracking-[0.12em] text-paper uppercase">
+        <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent motion-safe:animate-pulse" />
+        Ambiguous 3D Studio
+      </h1>
+      <div className="mt-2.5">
         <StatusBanner onRetryInit={onRetryInit} />
       </div>
     </div>
   )
 }
 
+/**
+ * ビューポート枠に出す「いま何を映しているか」のラベル（装飾のみ）。
+ *
+ * `useStudioStore` の `input` は**離散的**にしか変わらない（カタログ選択・
+ * SVG/テキスト差し替えなど）。カメラ操作はこれに触れないため、この購読が
+ * カメラ回転中の再レンダリングを引き起こすことはない（上の useSweetSpotProps
+ * と同じ不変条件 — NFR-002 は壊れない）。ラベル自体は aria-hidden の装飾
+ * （Gallery のカード強調と StatusBanner が実体の状態面）なので、二重の
+ * live リージョンを増やすことはない。
+ */
+function useCurrentIllusionLabel(): string | null {
+  const input = useStudioStore((s) => s.input)
+  return useMemo(() => {
+    const id = findAppliedEntryId(input)
+    if (id === null) return null
+    return ILLUSIONS.find((entry) => entry.id === id)?.name ?? null
+  }, [input])
+}
+
 function App() {
   const { geometryRef, retry } = useGenerationPipeline()
   const requestSnap = useViewerStore((s) => s.requestSnap)
   const sweetSpot = useSweetSpotProps()
+  const currentIllusionName = useCurrentIllusionLabel()
   const [modeState, dispatchMode] = useReducer(modeReducer, INITIAL_MODE_STATE)
   const { mode } = modeState
 
@@ -222,10 +250,10 @@ function App() {
       この外枠・高さ・順序は今回のモード追加でも変更していない
       （変えたのは aside の**中身**だけ — 下記コメント参照）。
     */
-    <div className="flex h-dvh flex-col-reverse overflow-hidden bg-neutral-950 text-neutral-100 md:flex-row">
+    <div className="flex h-dvh flex-col-reverse overflow-hidden bg-ink text-paper md:flex-row">
       <aside
         aria-label="コントロールサイドバー"
-        className="flex h-[45dvh] w-full shrink-0 flex-col overflow-hidden border-t border-neutral-800 md:h-full md:w-80 md:border-t-0 md:border-r"
+        className="hud-texture flex h-[45dvh] w-full shrink-0 flex-col overflow-hidden border-t border-line md:h-full md:w-80 md:border-t-0 md:border-r"
       >
         {/*
           モードタブ（新規）は aside の先頭に固定し、その下の 1 パネルだけが
@@ -254,8 +282,29 @@ function App() {
           {mode === 'puzzle' && <PuzzlePanel />}
         </div>
       </aside>
-      <main aria-label="3D ビューポート" className="min-h-0 min-w-0 flex-1">
+      <main aria-label="3D ビューポート" className="relative min-h-0 min-w-0 flex-1">
         <Viewport geometryRef={geometryRef} />
+        {/*
+          ビューポートの縁取り（owner 指摘: 「小さいグレーの物体が黒い背景に
+          何にも縁取られずに置いてあるだけ」）。装飾専用（pointer-events-none +
+          aria-hidden）で、OrbitControls のドラッグやキーボード操作を一切
+          妨げない。ここに置くのは Viewport.tsx を「照明・背景・マテリアルのみ」
+          というスコープに保つため — 枠とラベルは DOM 側（App.tsx）が持ち、
+          Viewport.tsx は R3F シーンの内部（フォグ・グリッド・光源色）だけを
+          持つ、という分担にした。
+        */}
+        <div aria-hidden="true" className="pointer-events-none absolute inset-3 sm:inset-4">
+          <span className="absolute top-0 left-0 h-4 w-4 border-t border-l border-accent/40" />
+          <span className="absolute top-0 right-0 h-4 w-4 border-t border-r border-accent/40" />
+          <span className="absolute bottom-0 left-0 h-4 w-4 border-b border-l border-accent/40" />
+          <span className="absolute right-0 bottom-0 h-4 w-4 border-r border-b border-accent/40" />
+          {currentIllusionName !== null && (
+            <div className="absolute top-3 left-3 flex max-w-[75%] items-center gap-1 border border-line-soft/80 bg-ink/80 px-2 py-1 text-[10px] text-muted">
+              <span className="shrink-0 text-accent">▸</span>
+              <span className="min-w-0 truncate">{currentIllusionName}</span>
+            </div>
+          )}
+        </div>
       </main>
     </div>
   )

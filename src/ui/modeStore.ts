@@ -20,10 +20,17 @@ export type StudioMode = 'catalogue' | 'free' | 'puzzle'
 /** モードの表示順（= タブの並び順）。カタログが常に先頭 */
 export const STUDIO_MODES: readonly StudioMode[] = ['catalogue', 'free', 'puzzle']
 
-/** モードのタブラベル（日本語） */
+/**
+ * モードのタブラベル（日本語）。
+ *
+ * **3 つとも 6 文字以内に収める。** タブは横並びで幅が限られており、
+ * 1 つでも長いとそこだけ 2 行に折り返して並びが崩れる（「自由に組み合わせる」
+ * が実際にそうなっていた）。折り返しは狭い画面ほど早く起きるので、
+ * 短くしておくことがそのままモバイル対応になる。
+ */
 export const MODE_LABELS: Record<StudioMode, string> = {
   catalogue: '錯視カタログ',
-  free: '自由に組み合わせる',
+  free: '自由に作る',
   puzzle: 'クイズ',
 }
 
