@@ -122,6 +122,33 @@
  * 軸角・オフセットの変更はジオメトリ・マテリアルの再生成を伴わない —
  * {@link applyMirrorTransform} が位置・回転だけを更新する（GPU 資源は
  * 再利用。連続的な操作でも Reflector の再生成コストを払わない）。
+ *
+ * ## 額縁と台座（所有者フィードバック「鏡が鏡ってわかりにくい」への対応）
+ *
+ * 反射面だけでは「壁に開いた穴」「もう 1 枚の絵」にしか見えない —
+ * スクリーンショットで確認済みの実際の症状（正面 (A) スナップは正射影の
+ * 正面図なので、無限グリッド床は視線とほぼ平行に見え、直接視でも反射像
+ * でもほぼ 1 本の線にしか映らない。したがって「反射像に床を映り込ませる」
+ * だけでは鏡だと伝わらない）。ここでは反射面はそのまま（位置・回転・
+ * ジオメトリ・{@link createMirrorMesh} は無変更）に、次の 2 つを別体の
+ * 非反射メッシュとして追加する（{@link createMirrorFrame}）:
+ *
+ * 1. **額縁**（上・左・右の 3 辺、{@link FRAME_BORDER} 幅・
+ *    {@link FRAME_DEPTH} の厚み）— 縁と厚みがあって初めて「そこに置かれた
+ *    物」に見える。下辺だけ額縁を付けないのは、反射面の下端が既に
+ *    グリッド床とちょうど接する高さにあり、下だけ縁を足すと床にめり込んで
+ *    見えるため（2 の台座がこの辺を引き継ぐ）。
+ * 2. **台座**（{@link STAND_WIDTH}×{@link STAND_HEIGHT}、床面から更に
+ *    {@link STAND_DEPTH} だけ奥へ張り出す脚）— 「宙に浮く矩形」ではなく
+ *    「床に立つ物」だと伝える最小限の接地。
+ *
+ * どちらも反射を持たない通常メッシュ 1 個（{@link buildMirrorFrameGeometry}
+ * で 4 パーツを 1 ジオメトリへ統合、ドローコール 1 個）で、Viewport 既存の
+ * 環境光・平行光だけで陰影が付く。反射面の追加レンダーパス（Reflector 側）
+ * とは無関係に、このメッシュ自体は毎フレーム通常の 1 回描画のみ —
+ * NFR-002 の 60fps 予算に対する追加コストは通常メッシュ 1 個分（実測して
+ * 妥当なら許容、そうでなければ削る）。ゲート・解放は反射面と対で行う
+ * （{@link disposeMirrorFrame}）。
  */
 /* eslint-disable react-refresh/only-export-components --
  * 生成・解放・ゲート判定を純関数として export し、Node の Vitest から
@@ -129,8 +156,15 @@
  * のはタスクのファイル所有権（このタスクが触れるのは VirtualMirror.tsx のみ）
  * による。編集時の Fast Refresh がフルリロードになる小さな代償を許容する */
 import { useEffect, useState } from 'react'
-import { PlaneGeometry } from 'three'
+import {
+  BoxGeometry,
+  type BufferGeometry,
+  Mesh,
+  MeshStandardMaterial,
+  PlaneGeometry,
+} from 'three'
 import { Reflector } from 'three/examples/jsm/objects/Reflector.js'
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import {
   DEFAULT_MIRROR_OFFSET,
   useStudioStore,
@@ -174,6 +208,45 @@ export const MIRROR_CENTER_Y = 0.15
 
 /** 反射レンダーターゲットの解像度（px）。B のシルエット判読を優先して 1024 */
 export const MIRROR_TEXTURE_SIZE = 1024
+
+/**
+ * 額縁の縁幅（作業座標）。上・左・右の 3 辺のみに使う（下辺は
+ * {@link STAND_HEIGHT} が受け持つ。ファイル冒頭「額縁と台座」参照）。
+ *
+ * **意図的に薄い**: {@link mirrorFrameExtent} 経由でこの値が
+ * `CameraRig.tsx` の視点 A スナップの構図（`frontMirrorFramingZoom`）に
+ * そのまま加算される。読みやすさは主に {@link FRAME_COLOR} のコントラスト
+ * （明るいブラッシュドメタル調）で稼いでおり、縁の物理的な太さへの依存は
+ * 小さいため、太さは構図側の予算を圧迫しない最小限に絞ってある —
+ * それでも `OrbitControls.minZoom`（CameraRig.tsx、0.2）が要求ズームの
+ * 下限として働くため、この縁が 0 でも同じ視点・軸角では画角の端で欠ける
+ * 場合がある（既存の問題。詳細は VirtualMirror.tsx を呼び出す側のレビュー
+ * コメント、または本コミットの説明を参照）。
+ */
+const FRAME_BORDER = 0.08
+
+/** 額縁の奥行き（厚み）。平面ではなく厚みを持つ物体だと伝える最小値 */
+const FRAME_DEPTH = 0.11
+
+/** 額縁の前面を反射面よりわずかに手前へ出す量（縁が鏡面より一段高い、実際の額縁の見え方） */
+const FRAME_FRONT_LIP = 0.02
+
+/**
+ * 額縁・台座の色。シーンがほぼ黒背景（ダーク UI）なので、反射像の減衰色
+ * （0xa9adb8）よりむしろ明るいブラッシュドメタル調にして、背景にも反射面
+ * にも埋もれず縁として読めるようにする（暗いグレーで揃えたところ、実機
+ * 確認でほぼ背景と見分かなくなったための修正）。
+ */
+const FRAME_COLOR = 0x9098a3
+
+/** 台座（脚）の幅。反射面いっぱいではなく中央だけ細く — 額縁ほど目立たせない */
+const STAND_WIDTH = MIRROR_WIDTH * 0.34
+
+/** 台座の高さ。反射面の下端（グリッド床面）からわずかに立ち上がるだけでよい */
+const STAND_HEIGHT = 0.14
+
+/** 台座が額縁背面からさらに奥へ張り出す奥行き。「床に接する脚」だと伝わる張り出し量 */
+const STAND_DEPTH = 0.5
 
 /** ゲート判定。コンポーネントとテストが同じ判定を共有する */
 export function selectVirtualMirrorEnabled(state: StudioState): boolean {
@@ -278,13 +351,17 @@ export function mirrorFrameExtent(
   offset: number = MIRROR_OFFSET,
 ): { minX: number; maxX: number; minY: number; maxY: number } {
   const { position, rotationY } = mirrorTransform(axisAngleDeg, offset)
-  const halfWidthX = (MIRROR_WIDTH / 2) * Math.abs(Math.cos(rotationY))
+  // 額縁（左右の縁）を含めた実効半幅。上辺の縁も同じ半幅で四隅を覆うので
+  // X 方向はこの半幅のままでよい
+  const halfWidthX = (MIRROR_WIDTH / 2 + FRAME_BORDER) * Math.abs(Math.cos(rotationY))
   const halfHeightY = MIRROR_HEIGHT / 2
   return {
     minX: position[0] - halfWidthX,
     maxX: position[0] + halfWidthX,
+    // 下辺は台座がグリッド床の高さに合わせてあるので反射面の下端のまま。
+    // 上辺だけ額縁の縁の分だけ広げる（額縁と台座の実際の footprint と一致させる）
     minY: position[1] - halfHeightY,
-    maxY: position[1] + halfHeightY,
+    maxY: position[1] + halfHeightY + FRAME_BORDER,
   }
 }
 
@@ -343,6 +420,97 @@ export function disposeMirrorMesh(mirror: Reflector): void {
 }
 
 /**
+ * 額縁＋台座の形状を作る（反射面とは別体・非反射のメッシュ 1 つにまとめる
+ * — パーツを増やしてもドローコールは 1 個のまま）。ローカル座標は反射面
+ * （`PlaneGeometry(MIRROR_WIDTH, MIRROR_HEIGHT)`）と同じ原点・同じ軸を
+ * 共有するので、{@link applyMirrorFrameTransform} で反射面とまったく
+ * 同じ position・rotationY を与えるだけで縁取りとして揃う（ファイル冒頭
+ * 「額縁と台座」参照）。
+ */
+function buildMirrorFrameGeometry(): BufferGeometry {
+  const halfW = MIRROR_WIDTH / 2
+  const halfH = MIRROR_HEIGHT / 2
+  const frameZ = FRAME_FRONT_LIP - FRAME_DEPTH / 2
+  const parts = [
+    // 上辺（左右の縁の分だけ幅広く作り、四隅を覆う）
+    new BoxGeometry(MIRROR_WIDTH + FRAME_BORDER * 2, FRAME_BORDER, FRAME_DEPTH).translate(
+      0,
+      halfH + FRAME_BORDER / 2,
+      frameZ,
+    ),
+    // 左辺
+    new BoxGeometry(FRAME_BORDER, MIRROR_HEIGHT, FRAME_DEPTH).translate(
+      -(halfW + FRAME_BORDER / 2),
+      0,
+      frameZ,
+    ),
+    // 右辺
+    new BoxGeometry(FRAME_BORDER, MIRROR_HEIGHT, FRAME_DEPTH).translate(
+      halfW + FRAME_BORDER / 2,
+      0,
+      frameZ,
+    ),
+    // 台座。下端は反射面の下端（＝グリッド床）とちょうど同じ高さ — 床に
+    // めり込ませず、額縁背面からさらに奥へ張り出して脚だと分かる幅を持たせる
+    new BoxGeometry(STAND_WIDTH, STAND_HEIGHT, STAND_DEPTH).translate(
+      0,
+      -halfH + STAND_HEIGHT / 2,
+      FRAME_FRONT_LIP - FRAME_DEPTH - STAND_DEPTH / 2,
+    ),
+  ]
+  const merged = mergeGeometries(parts)
+  for (const part of parts) part.dispose()
+  return merged
+}
+
+/**
+ * 額縁＋台座のメッシュを生成する。純関数 — {@link createMirrorMesh} と対に
+ * なる（GPU 資源は最初の描画まで確保されない。Node でテスト可能）。反射は
+ * 行わない通常のライト受けメッシュなので、Viewport 既存の環境光・平行光
+ * だけで陰影が付き、追加の反射レンダーパスは発生しない（反射面側の
+ * 追加パスとは無関係。NFR-002 に対しては通常メッシュ 1 個分のコストのみ）。
+ */
+/** 額縁＋台座メッシュの型（マテリアルを具体型に固定し、dispose() を型エラーなく呼べるようにする） */
+type MirrorFrameMesh = Mesh<BufferGeometry, MeshStandardMaterial>
+
+export function createMirrorFrame(
+  axisAngleDeg: number = DEFAULT_AXIS_ANGLE_DEG,
+  offset: number = MIRROR_OFFSET,
+): MirrorFrameMesh {
+  const geometry = buildMirrorFrameGeometry()
+  const material = new MeshStandardMaterial({
+    color: FRAME_COLOR,
+    roughness: 0.35,
+    metalness: 0.5,
+  })
+  const frame: MirrorFrameMesh = new Mesh(geometry, material)
+  applyMirrorFrameTransform(frame, axisAngleDeg, offset)
+  return frame
+}
+
+/**
+ * 額縁＋台座の位置・回転だけを更新する。{@link applyMirrorTransform} と
+ * 同じ {@link mirrorTransform} を呼ぶので、反射面と常に同じ配置を保つ —
+ * 鏡本体の向き・配置そのものは一切変更しない（このファイルはあくまで
+ * 反射面に追従するだけ）。
+ */
+export function applyMirrorFrameTransform(
+  frame: MirrorFrameMesh,
+  axisAngleDeg: number = DEFAULT_AXIS_ANGLE_DEG,
+  offset: number = MIRROR_OFFSET,
+): void {
+  const { position, rotationY } = mirrorTransform(axisAngleDeg, offset)
+  frame.position.set(position[0], position[1], position[2])
+  frame.rotation.y = rotationY
+}
+
+/** 額縁＋台座の資源を解放する（{@link disposeMirrorMesh} と対で呼ぶ） */
+export function disposeMirrorFrame(frame: MirrorFrameMesh): void {
+  frame.geometry.dispose()
+  frame.material.dispose()
+}
+
+/**
  * 仮想ミラー（Viewport の Canvas 直下にマウントする）。
  * store の `options.virtualMirror` がゲート — 無効なら {@link MirrorPlane} を
  * マウントせず、有効 → 無効の切り替えでアンマウントして反射レンダー
@@ -366,7 +534,11 @@ function selectMirrorOffset(state: StudioState): number {
   return state.options.mirrorOffset
 }
 
-/** 反射面の実体。マウント中だけ Reflector が存在し、追加レンダーパスを払う */
+/**
+ * 反射面＋額縁＋台座の実体。マウント中だけ存在し、反射面（Reflector）が
+ * 追加レンダーパスを払う。額縁・台座は反射を持たない通常メッシュ 1 個
+ * （{@link createMirrorFrame}）で、追加パスは発生しない。
+ */
 function MirrorPlane() {
   // FR-102: 軸角・オフセットの変更（NumberField のコミット単位。連続ドラッグ
   // ではない）だけ再レンダリングする — カメラ操作中の 60fps 予算（NFR-002）
@@ -376,15 +548,23 @@ function MirrorPlane() {
   // マウントにつき 1 個。StrictMode の initializer 二重呼び出しで捨てられる
   // 個体は一度も描画されないため GPU 資源を持たず、GC に任せてよい
   const [mirror] = useState(() => createMirrorMesh(axisAngleDeg, offset))
+  const [frame] = useState(() => createMirrorFrame(axisAngleDeg, offset))
   // アンマウント（= 無効化）で反射レンダーターゲットを解放する。
   // R3F は <primitive> の外来オブジェクトを自動 dispose しないので、
   // このクリーンアップが唯一の解放経路
   useEffect(() => () => disposeMirrorMesh(mirror), [mirror])
+  useEffect(() => () => disposeMirrorFrame(frame), [frame])
   // 軸角・オフセットが変わるたびに位置・回転だけ更新する（ジオメトリ・
   // マテリアル・反射レンダーターゲットは再生成しない — Reflector の
-  // 再生成は高コスト）
+  // 再生成は高コスト）。額縁・台座も同じ配置に追従させる
   useEffect(() => {
     applyMirrorTransform(mirror, axisAngleDeg, offset)
-  }, [mirror, axisAngleDeg, offset])
-  return <primitive object={mirror} />
+    applyMirrorFrameTransform(frame, axisAngleDeg, offset)
+  }, [mirror, frame, axisAngleDeg, offset])
+  return (
+    <>
+      <primitive object={mirror} />
+      <primitive object={frame} />
+    </>
+  )
 }

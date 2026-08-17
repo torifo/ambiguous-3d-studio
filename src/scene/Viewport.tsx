@@ -133,22 +133,40 @@ export function Viewport(props: ViewportProps) {
         ドラッグで回転、ホイールまたは ＋ / − キーでズームします。視点のスナップとリセットはサイドバーのボタンから操作できます。
       </p>
       <Canvas camera={CAMERA_PROPS} dpr={DPR_RANGE} gl={{ antialias: true }}>
-        <color attach="background" args={['#0a0a0a']} />
-        {/* 三点照明の簡易形。強い影は付けない（シルエットの視認を優先） */}
-        <ambientLight intensity={0.5} />
-        <directionalLight position={[4, 6, 3]} intensity={1.1} />
-        <directionalLight position={[-5, 2, -2]} intensity={0.35} />
+        {/*
+          見た目の改修（照明・背景・グリッドのみ。カメラ・マテリアルは対象外）。
+          参照デザイン（~/dev/design/art-gallery/digital）の true black を
+          背景に採用し、フォグで奥行きを付ける — 「小さいグレーの物体が
+          黒い背景に何にも縁取られずに置いてある」という指摘への対応。
+          フォグは three.js の描画パスに元から乗る効果で、追加のドローコールも
+          毎フレームの JS 計算も発生しない（NFR-002 の 60fps 予算を消費しない）。
+          縁取り自体（コーナーブラケット・ラベル）は DOM 側（App.tsx）が持つ —
+          ここはあくまでシーン内部だけを扱う。
+        */}
+        <color attach="background" args={['#000000']} />
+        <fog attach="fog" args={['#000000', 9, 24]} />
+        {/* 三点照明 + 縁取り用のリムライト（アクセントカラー）。強い影は付けない
+            （シルエットの視認を優先）。アンビエントを少し落とし主光をわずかに
+            強めて、フラットに見えないコントラストを作る */}
+        <ambientLight intensity={0.38} />
+        <directionalLight position={[4, 6, 3]} intensity={1.2} />
+        <directionalLight position={[-5, 2, -2]} intensity={0.3} />
+        {/* 立体の輪郭にわずかな accent 色の縁光を入れる。強度は低く、
+            素材の色味（SolidMesh.tsx・対象外）を汚さない程度に留める */}
+        <directionalLight position={[-4, 1.5, -5]} intensity={0.22} color="#00ff88" />
         {/* グリッド床。立体は原点中心・高さ 2（WORKING_HEIGHT）なので
-            最小 Y (=-1) の少し下に敷く（Z-fighting と正面ビューの重なり回避） */}
+            最小 Y (=-1) の少し下に敷く（Z-fighting と正面ビューの重なり回避）。
+            色はデザイントークンに合わせて沈め、セクション線にわずかな
+            accent の緑みを足した（ターミナル的なグリッドの質感） */}
         <Grid
           position={[0, -1.15, 0]}
           cellSize={0.5}
           cellThickness={0.6}
-          cellColor="#33333c"
+          cellColor="#181818"
           sectionSize={2}
           sectionThickness={1}
-          sectionColor="#4a4f60"
-          fadeDistance={28}
+          sectionColor="#2c3a33"
+          fadeDistance={22}
           fadeStrength={1}
           infiniteGrid
         />

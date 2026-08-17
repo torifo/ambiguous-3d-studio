@@ -73,7 +73,9 @@ import { useStudioStore } from '../store/useStudioStore'
 import {
   angleBetween,
   easeInOutCubic,
-  frontMirrorFramingZoom,
+  APPROX_SOLID_HALF_HEIGHT,
+  APPROX_SOLID_HALF_WIDTH,
+  FRAME_MARGIN,
   matchedSweetSpot,
   orthoZoomToMatchPerspective,
   perspectiveDistanceToMatchOrtho,
@@ -131,6 +133,10 @@ const ORIGIN = new Vector3(0, 0, 0)
 /** 毎フレームの一時ベクトル（アロケーション回避。リグは 1 個しか置かない） */
 const TMP_FORWARD = new Vector3()
 const TMP_DIR = new Vector3()
+/** 正面 ＋ ミラー時の構図パン量（再利用してフレーム内の確保を避ける） */
+const TMP_PAN = new Vector3()
+/** OrbitControls の既定ズーム下限。ミラー構図はこれを一時的に下回る */
+const DEFAULT_MIN_ZOOM = 0.2
 
 /** OS の「視差効果を減らす」設定。スナップ時に都度評価する（FR-027） */
 function prefersReducedMotion(): boolean {
@@ -276,24 +282,43 @@ export function CameraRig() {
       let zoom = orthoZoomToMatchPerspective(ORTHO_HALF_HEIGHT, persp.fov, distance)
       const aspect = st.size.width / Math.max(st.size.height, 1)
 
+      // 正面 ＋ ミラー有効のときだけ、立体と鏡像の**両方**が入るように構図を組む。
+      // 鏡像は原点から離れた位置（既定 90° で screen x ≈ MIRROR_OFFSET）に現れるため、
+      // 原点中心のまま画角を広げるだけでは左半分が空白になり、右が溢れる。
+      // 中点へパンしてから収めると、必要な半幅がほぼ半分で済み、構図も釣り合う。
+      let panX = 0
+      let panY = 0
       if (view === 'front' && selectVirtualMirrorEnabled(useStudioStore.getState())) {
         const { input, options } = useStudioStore.getState()
         const mirror = mirrorFrameExtent(input.axisAngleDeg, options.mirrorOffset)
-        zoom = frontMirrorFramingZoom(
+        const minX = Math.min(-APPROX_SOLID_HALF_WIDTH, mirror.minX)
+        const maxX = Math.max(APPROX_SOLID_HALF_WIDTH, mirror.maxX)
+        const minY = Math.min(-APPROX_SOLID_HALF_HEIGHT, mirror.minY)
+        const maxY = Math.max(APPROX_SOLID_HALF_HEIGHT, mirror.maxY)
+        panX = (minX + maxX) / 2
+        panY = (minY + maxY) / 2
+        const halfW = ((maxX - minX) / 2) * FRAME_MARGIN
+        const halfH = ((maxY - minY) / 2) * FRAME_MARGIN
+        zoom = Math.min(
           zoom,
-          aspect,
-          ORTHO_HALF_HEIGHT,
-          [mirror.minX, mirror.maxX],
-          [mirror.minY, mirror.maxY],
+          ORTHO_HALF_HEIGHT / halfH,
+          (ORTHO_HALF_HEIGHT * aspect) / halfW,
         )
       }
+
+      // OrbitControls.update() は毎回 camera.zoom を [minZoom, maxZoom] に
+      // クランプする。ここで算出した値が minZoom を下回ると、直後の update() で
+      // 押し戻され、**計算した画角が一切効かない**（鏡が画面外へはみ出す形で
+      // 現れていた実際の不具合）。下限をこの値まで開けてから適用する。
+      controls.minZoom = Math.min(DEFAULT_MIN_ZOOM, zoom)
 
       ortho.zoom = zoom
       ortho.left = -ORTHO_HALF_HEIGHT * aspect
       ortho.right = ORTHO_HALF_HEIGHT * aspect
       ortho.top = ORTHO_HALF_HEIGHT
       ortho.bottom = -ORTHO_HALF_HEIGHT
-      ortho.position.copy(persp.position)
+      controls.target.set(panX, panY, 0)
+      ortho.position.copy(persp.position).add(TMP_PAN.set(panX, panY, 0))
       const up = snapUp(view)
       ortho.up.set(up.x, up.y, up.z)
       ortho.updateProjectionMatrix()
@@ -398,7 +423,7 @@ export function CameraRig() {
     controls.dampingFactor = 0.08
     controls.minDistance = 1.5
     controls.maxDistance = 40
-    controls.minZoom = 0.2
+    controls.minZoom = DEFAULT_MIN_ZOOM
     controls.maxZoom = 40
     controls.target.set(0, 0, 0)
     controls.update()
