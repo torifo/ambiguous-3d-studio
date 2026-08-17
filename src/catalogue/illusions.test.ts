@@ -10,6 +10,7 @@ import {
   isUnbuildableIllusion,
   type IllusionCategory,
   type IllusionEntry,
+  type IllusionReference,
 } from './illusions'
 
 /**
@@ -121,6 +122,29 @@ describe('ILLUSIONS', () => {
         expect(text, `${entry.id}: 前後の空白`).toBe(text.trim())
       }
     }
+  })
+
+  describe('references — 外部参照先の形を保証する（実在確認そのものはオフラインではできない）', () => {
+    it.each(ILLUSIONS.map((entry) => [entry.id, entry] as const))(
+      '%s: label は空でない / url は絶対 https / 同一エントリ内で重複しない',
+      (_id, entry: IllusionEntry) => {
+        if (entry.references === undefined) return
+        const seenUrls = new Set<string>()
+        for (const ref of entry.references as readonly IllusionReference[]) {
+          expect(ref.label.trim().length, `${entry.id}: label が空`).toBeGreaterThan(0)
+          // http だけの参照や相対パスを弾く。実在確認（本当にその内容が読めるか）は
+          // ネットワークが要るためこのテストの範囲外 — カタログ執筆時に人手で確認する
+          expect(ref.url, `${entry.id}: url は https:// で始まる絶対 URL`).toMatch(
+            /^https:\/\/.+/,
+          )
+          expect(seenUrls.has(ref.url), `${entry.id}: url が重複 (${ref.url})`).toBe(false)
+          seenUrls.add(ref.url)
+          if (ref.note !== undefined) {
+            expect(ref.note.trim().length, `${entry.id}: note`).toBeGreaterThan(0)
+          }
+        }
+      },
+    )
   })
 
   describe('buildable: true — 再現設定が実在するものだけを参照する', () => {
